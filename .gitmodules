@@ -1,0 +1,6 @@
+[submodule "ocaml-arrow"]
+	path = ocaml-arrow
+	url = https://github.com/LaurentMazare/ocaml-arrow
+[submodule "notty"]
+	path = notty
+	url = https://github.com/pqwy/notty
