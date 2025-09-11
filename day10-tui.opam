@@ -12,6 +12,11 @@ bug-reports: "https://github.com/username/reponame/issues"
 depends: [
   "dune" {>= "3.18"}
   "ocaml"
+  "ctypes"
+  "ctypes-foreign"
+  "base"
+  "core_kernel"
+  "stdio"
   "odoc" {with-doc}
 ]
 build: [

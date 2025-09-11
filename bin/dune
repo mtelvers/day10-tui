@@ -1,3 +1,4 @@
 (executable
  (public_name day10-tui)
- (name main))
+ (name main)
+ (libraries arrow.c_api notty notty.unix day10_tui_lib))
