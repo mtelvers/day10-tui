@@ -53,16 +53,15 @@ module Dialog = struct
     let message_lines =
       if String.length clean_message <= message_width then [ clean_message ]
       else
-        (* Simple word wrapping - could be enhanced *)
         let words = String.split clean_message ~on:' ' in
-        let rec wrap_words acc current_line remaining =
-          match remaining with
-          | [] -> if String.is_empty current_line then acc else acc @ [ current_line ]
-          | word :: rest ->
-              let new_line = if String.is_empty current_line then word else current_line ^ " " ^ word in
-              if String.length new_line <= message_width then wrap_words acc new_line rest else wrap_words (acc @ [ current_line ]) word rest
+        let fold_word (lines, current_line) word =
+          let new_line = if String.is_empty current_line then word else current_line ^ " " ^ word in
+          if String.length new_line <= message_width then (lines, new_line)
+          else if String.is_empty current_line then ([ word ], "") (* Handle very long single words *)
+          else (lines @ [ current_line ], word)
         in
-        wrap_words [] "" words
+        let lines, final_line = List.fold words ~init:([], "") ~f:fold_word in
+        if String.is_empty final_line then lines else lines @ [ final_line ]
     in
 
     let message_imgs = List.map message_lines ~f:(I.string A.(fg white)) in

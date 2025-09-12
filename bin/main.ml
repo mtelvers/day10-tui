@@ -14,10 +14,34 @@ type commit_info = {
   downloaded : bool;
 }
 
-type detail_info = {
-  package : string;
-  compiler : string;
+module Build_key = struct
+  type t = {
+    package : string;
+    compiler : string;
+  }
+
+  let create ~package ~compiler = { package; compiler }
+
+  let compare k1 k2 =
+    match String.compare k1.package k2.package with
+    | 0 -> String.compare k1.compiler k2.compiler
+    | n -> n
+
+  let hash { package; compiler } = Base.Hashtbl.hash (package, compiler)
+  let sexp_of_t { package; compiler } = Base.Sexp.List [ Base.Sexp.Atom package; Base.Sexp.Atom compiler ]
+end
+
+type build_key = Build_key.t
+
+type build_result = {
   status : string;
+  log : string option;
+  solution : string option;
+}
+
+type detail_info = {
+  key : build_key;
+  result : build_result;
   log_lines : string list;
   solution_lines : string list;
   detail_scroll : int;
@@ -36,7 +60,7 @@ type app_mode =
 
 type tui_state = {
   opam_repo_path : string;
-  build_map : (string, string * string option * string option) Hashtbl.t;
+  build_map : (build_key, build_result) Hashtbl.t;
   packages : string list;
   compilers : string list;
   scroll_x : int; (* horizontal scroll for compilers *)
@@ -47,27 +71,37 @@ type tui_state = {
 }
 
 let get_git_commits opam_repo_path =
-  let cmd = Printf.sprintf "git -C %s log --oneline -n 50 --format='%%H|%%s|%%ci' 2>/dev/null" opam_repo_path in
+  let cmd = Stdlib.Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "-n"; "50"; "--format=%H|%s|%ci" ] ~stderr:"/dev/null" in
   try
     let ic = Unix.open_process_in cmd in
-    let rec read_lines acc =
+    let result =
       try
-        let line = Stdio.In_channel.input_line_exn ic in
-        let parts = String.split line ~on:'|' in
-        match parts with
-        | [ sha; message; date ] ->
-            let commit = { sha; message; date; downloaded = Stdlib.Sys.file_exists (sha ^ ".parquet") } in
-            read_lines (commit :: acc)
-        | _ -> read_lines acc
+        let rec read_lines acc =
+          try
+            let line = Stdio.In_channel.input_line_exn ic in
+            let parts = String.split line ~on:'|' in
+            match parts with
+            | [ sha; message; date ] ->
+                let commit = { sha; message; date; downloaded = Stdlib.Sys.file_exists (sha ^ ".parquet") } in
+                read_lines (commit :: acc)
+            | _ -> read_lines acc
+          with
+          | End_of_file -> acc
+        in
+        let commits = read_lines [] in
+        let exit_status = Unix.close_process_in ic in
+        match exit_status with
+        | Unix.WEXITED 0 -> `Success (List.rev commits)
+        | _ -> `Error (Printf.sprintf "Git command failed for %s" opam_repo_path)
       with
-      | End_of_file -> acc
+      | exn ->
+          let _ = Unix.close_process_in ic in
+          raise exn
     in
-    let commits = read_lines [] in
-    let exit_status = Unix.close_process_in ic in
-    match exit_status with
-    | Unix.WEXITED 0 -> List.rev commits
-    | _ ->
-        printf "Warning: Failed to get git commits from %s\n" opam_repo_path;
+    match result with
+    | `Success commits -> commits
+    | `Error msg ->
+        printf "Warning: %s\n" msg;
         []
   with
   | Unix.Unix_error (error, _, _) ->
@@ -81,7 +115,7 @@ let download_parquet sha =
   let filename = sha ^ ".parquet" in
   if not (Stdlib.Sys.file_exists filename) then
     let url = Printf.sprintf "https://www.cl.cam.ac.uk/~mte24/day10/%s.parquet" sha in
-    let cmd = Printf.sprintf "curl -s -f -o %s %s 2>/dev/null" filename url in
+    let cmd = Stdlib.Filename.quote_command "curl" [ "-s"; "-f"; "-o"; filename; url ] ~stderr:"/dev/null" in
     let exit_code = Stdlib.Sys.command cmd in
     if exit_code = 0 && Stdlib.Sys.file_exists filename then `Success
     else (
@@ -113,12 +147,13 @@ let analyze_data filename =
   let unique_compilers = extract_non_null compiler_col |> Set.of_list (module String) |> Set.to_list in
 
   (* Create a lookup map: (package, compiler) -> (status, log, solution) *)
-  let build_map = Hashtbl.create (module String) in
+  let build_map = Hashtbl.create (module Build_key) in
   Array.iteri name_col ~f:(fun i name_opt ->
       match (name_opt, status_col.(i), compiler_col.(i), log_col.(i), solution_col.(i)) with
-      | Some name, Some status, Some compiler, log_opt, solution_opt ->
-          let key = name ^ "|" ^ compiler in
-          Hashtbl.set build_map ~key ~data:(status, log_opt, solution_opt)
+      | Some package, Some status, Some compiler, log, solution ->
+          let key = Build_key.create ~package ~compiler in
+          let result = { status; log; solution } in
+          Hashtbl.set build_map ~key ~data:result
       | _ -> ());
 
   (build_map, unique_packages, unique_compilers)
@@ -164,7 +199,7 @@ let show_error_message term error_msg =
   Day10_tui_lib.Dialog_widget.Dialog.show_dialog term config
 
 let draw_detail_view detail (w, h) =
-  let header = Printf.sprintf "Package: %s | Compiler: %s | Status: %s" detail.package detail.compiler detail.status in
+  let header = Printf.sprintf "Package: %s | Compiler: %s | Status: %s" detail.key.package detail.key.compiler detail.result.status in
 
   let build_log_section =
     Day10_tui_lib.Text_viewer_widget.TextViewer.
@@ -203,11 +238,11 @@ let draw_table state (w, h) =
   let get_cell ~row ~column =
     if String.equal column "_row_name" then { Table_widget.Table.text = row; attr = A.(fg white) }
     else
-      let key = row ^ "|" ^ column in
+      let key = Build_key.create ~package:row ~compiler:column in
       match Hashtbl.find state.build_map key with
-      | Some (status, _log, _solution) ->
-          let color = status_color status in
-          let char = status_char status in
+      | Some result ->
+          let color = status_color result.status in
+          let char = status_char result.status in
           { Table_widget.Table.text = char; attr = color }
       | None -> { Table_widget.Table.text = "-"; attr = A.(fg white) }
   in
@@ -228,28 +263,26 @@ let draw_table state (w, h) =
 
   Table_widget.Table.draw_table config (w, h)
 
-let rec event_loop term state =
-  let img =
-    match state.mode with
-    | Home_view home -> draw_home_view home (Term.size term)
-    | Table_view -> draw_table state (Term.size term)
-    | Detail_view detail -> draw_detail_view detail (Term.size term)
-  in
-  Term.image term img;
-  match (state.mode, Term.event term) with
-  | Home_view home, `Key (`Arrow `Up, []) ->
+let sanitize_text text =
+  String.map text ~f:(fun c ->
+      let code = Char.to_int c in
+      if code < 32 && code <> 10 then ' ' else c)
+
+let handle_home_event term state home event =
+  match event with
+  | `Key (`Arrow `Up, []) ->
       let new_selected = max 0 (home.selected_commit - 1) in
       let new_scroll = if new_selected < home.scroll_offset then new_selected else home.scroll_offset in
       let new_home = { home with selected_commit = new_selected; scroll_offset = new_scroll } in
-      event_loop term { state with mode = Home_view new_home }
-  | Home_view home, `Key (`Arrow `Down, []) ->
+      `Continue { state with mode = Home_view new_home }
+  | `Key (`Arrow `Down, []) ->
       let max_idx = List.length home.commits - 1 in
       let new_selected = min max_idx (home.selected_commit + 1) in
       let content_height = snd (Term.size term) - 3 in
       let new_scroll = if new_selected >= home.scroll_offset + content_height then new_selected - content_height + 1 else home.scroll_offset in
       let new_home = { home with selected_commit = new_selected; scroll_offset = new_scroll } in
-      event_loop term { state with mode = Home_view new_home }
-  | Home_view home, `Key (`Enter, []) -> (
+      `Continue { state with mode = Home_view new_home }
+  | `Key (`Enter, []) -> (
       match List.nth home.commits home.selected_commit with
       | Some commit -> (
           let filename = commit.sha ^ ".parquet" in
@@ -258,89 +291,113 @@ let rec event_loop term state =
               try
                 let build_map, packages, compilers = analyze_data filename in
                 let new_state = { state with build_map; packages; compilers; mode = Table_view } in
-                event_loop term new_state
+                `Continue new_state
               with
               | exn ->
                   let raw_error = Exn.to_string exn in
-                  (* Sanitize control characters that cause Notty issues *)
-                  let clean_error =
-                    String.map raw_error ~f:(fun c ->
-                        let code = Char.to_int c in
-                        if code < 32 then ' ' else c)
-                  in
+                  let clean_error = sanitize_text raw_error in
                   let error_msg = Printf.sprintf "Failed to parse parquet file: %s" clean_error in
                   show_error_message term error_msg;
-                  event_loop term state)
+                  `Continue state)
           | `Error error_msg ->
               show_error_message term error_msg;
-              event_loop term state)
-      | None -> event_loop term state)
-  | Detail_view detail, `Key (`Arrow `Up, []) ->
+              `Continue state)
+      | None -> `Continue state)
+  | `Key (`ASCII 'q', [])
+  | `Key (`Escape, []) ->
+      `Quit
+  | _ -> `Continue state
+
+let handle_detail_event term state detail event =
+  match event with
+  | `Key (`Arrow `Up, []) ->
       let new_scroll = max 0 (detail.detail_scroll - 1) in
       let new_detail = { detail with detail_scroll = new_scroll } in
-      event_loop term { state with mode = Detail_view new_detail }
-  | Detail_view detail, `Key (`Arrow `Down, []) ->
+      `Continue { state with mode = Detail_view new_detail }
+  | `Key (`Arrow `Down, []) ->
       let total_lines = List.length detail.log_lines + List.length detail.solution_lines + 4 in
-      (* headers + spacing *)
       let max_scroll = max 0 (total_lines - (snd (Term.size term) - 3)) in
       let new_scroll = min max_scroll (detail.detail_scroll + 1) in
       let new_detail = { detail with detail_scroll = new_scroll } in
-      event_loop term { state with mode = Detail_view new_detail }
-  | Detail_view _, (`Key (`Escape, []) | `Key (`ASCII 'q', [])) -> event_loop term { state with mode = Table_view }
-  | Table_view, `Key (`ASCII 'h', []) ->
+      `Continue { state with mode = Detail_view new_detail }
+  | `Key (`Escape, [])
+  | `Key (`ASCII 'q', []) ->
+      `Continue { state with mode = Table_view }
+  | _ -> `Continue state
+
+let handle_table_event term state event =
+  match event with
+  | `Key (`ASCII 'h', []) ->
       let commits = get_git_commits state.opam_repo_path in
       let home = { commits; selected_commit = 0; scroll_offset = 0 } in
-      event_loop term { state with mode = Home_view home }
-  | Table_view, `Key (`Arrow `Up, []) ->
+      `Continue { state with mode = Home_view home }
+  | `Key (`Arrow `Up, []) ->
       let new_y = max 0 (state.selected_y - 1) in
       let new_scroll_y = if new_y < state.scroll_y then new_y else state.scroll_y in
-      event_loop term { state with selected_y = new_y; scroll_y = new_scroll_y }
-  | Table_view, `Key (`Arrow `Down, []) ->
+      `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
+  | `Key (`Arrow `Down, []) ->
       let max_y = List.length state.packages - 1 in
       let new_y = min max_y (state.selected_y + 1) in
       let term_height = snd (Term.size term) - 4 in
       let new_scroll_y = if new_y >= state.scroll_y + term_height then new_y - term_height + 1 else state.scroll_y in
-      event_loop term { state with selected_y = new_y; scroll_y = new_scroll_y }
-  | Table_view, `Key (`Arrow `Left, []) ->
+      `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
+  | `Key (`Arrow `Left, []) ->
       let new_x = max 0 (state.selected_x - 1) in
       let new_scroll_x = if new_x < state.scroll_x then new_x else state.scroll_x in
-      event_loop term { state with selected_x = new_x; scroll_x = new_scroll_x }
-  | Table_view, `Key (`Arrow `Right, []) ->
+      `Continue { state with selected_x = new_x; scroll_x = new_scroll_x }
+  | `Key (`Arrow `Right, []) ->
       let max_x = List.length state.compilers - 1 in
       let new_x = min max_x (state.selected_x + 1) in
       let term_width = fst (Term.size term) in
       let visible_compilers = (term_width - 30) / 15 in
       let new_scroll_x = if new_x >= state.scroll_x + visible_compilers then new_x - visible_compilers + 1 else state.scroll_x in
-      event_loop term { state with selected_x = new_x; scroll_x = new_scroll_x }
-  | Table_view, `Key (`Enter, []) -> (
+      `Continue { state with selected_x = new_x; scroll_x = new_scroll_x }
+  | `Key (`Enter, []) -> (
       let package = List.nth_exn state.packages state.selected_y in
       let compiler = List.nth_exn state.compilers state.selected_x in
-      let key = package ^ "|" ^ compiler in
+      let key = Build_key.create ~package ~compiler in
       match Hashtbl.find state.build_map key with
-      | Some (status, log_opt, solution_opt) ->
-          let sanitize_text text =
-            String.map text ~f:(fun c ->
-                let code = Char.to_int c in
-                if code < 32 && code <> 10 then ' ' else c)
-          in
-          (* Keep newlines for split_lines *)
+      | Some result ->
           let log_lines =
-            match log_opt with
+            match result.log with
             | Some log when String.length log > 0 -> String.split_lines (sanitize_text log)
             | _ -> []
           in
           let solution_lines =
-            match solution_opt with
+            match result.solution with
             | Some solution when String.length solution > 0 -> String.split_lines (sanitize_text solution)
             | _ -> []
           in
-          let detail = { package; compiler; status; log_lines; solution_lines; detail_scroll = 0 } in
-          event_loop term { state with mode = Detail_view detail }
-      | None -> event_loop term state)
-  | Table_view, (`Key (`ASCII 'q', []) | `Key (`Escape, [])) -> ()
-  | Home_view _, (`Key (`ASCII 'q', []) | `Key (`Escape, [])) -> ()
-  | _, `Resize _ -> event_loop term state
-  | _, _ -> event_loop term state
+          let detail = { key; result; log_lines; solution_lines; detail_scroll = 0 } in
+          `Continue { state with mode = Detail_view detail }
+      | None -> `Continue state)
+  | `Key (`ASCII 'q', [])
+  | `Key (`Escape, []) ->
+      `Quit
+  | _ -> `Continue state
+
+let rec event_loop term state =
+  let img =
+    match state.mode with
+    | Home_view home -> draw_home_view home (Term.size term)
+    | Table_view -> draw_table state (Term.size term)
+    | Detail_view detail -> draw_detail_view detail (Term.size term)
+  in
+  Term.image term img;
+  let event = Term.event term in
+  let result =
+    match (state.mode, event) with
+    | Home_view home, event -> handle_home_event term state home event
+    | Detail_view detail, event -> handle_detail_event term state detail event
+    | Table_view, event -> handle_table_event term state event
+  in
+  match result with
+  | `Continue new_state -> event_loop term new_state
+  | `Quit -> ()
+  | _ -> (
+      match event with
+      | `Resize _ -> event_loop term state
+      | _ -> event_loop term state)
 
 let () =
   let opam_repo_path = if Array.length Stdlib.Sys.argv > 1 then Stdlib.Sys.argv.(1) else Stdlib.Sys.getenv "HOME" ^ "/opam-repository" in
@@ -362,7 +419,7 @@ let () =
     let state =
       {
         opam_repo_path;
-        build_map = Hashtbl.create (module String);
+        build_map = Hashtbl.create (module Build_key);
         packages = [];
         compilers = [];
         scroll_x = 0;
