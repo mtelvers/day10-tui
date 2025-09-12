@@ -19,6 +19,7 @@ module Table = struct
     selected_col : int option;
     scroll_row : int;
     scroll_col : int;
+    help_text : string;
   }
 
   let padding str width attr =
@@ -101,18 +102,9 @@ module Table = struct
 
     let table = List.fold data_rows ~init:header ~f:I.( <-> ) in
 
-    (* Add status bar *)
-    let pos_info =
-      Printf.sprintf "Pos: %s Scroll: %d,%d"
-        (match (config.selected_row, config.selected_col) with
-        | Some r, Some c -> Printf.sprintf "%d,%d" c r
-        | _ -> "none")
-        config.scroll_col config.scroll_row
-    in
-    let help_info = "Arrow keys: move, Enter: details, q: quit" in
-    let status_config = Status_bar_widget.StatusBar.create_default_status ~position:pos_info ~help:help_info in
-    let status_bar = Status_bar_widget.StatusBar.draw_status_bar status_config w in
+    (* Add help bar *)
+    let help_bar = I.string A.(fg black ++ bg white) config.help_text in
 
-    let final_table = I.(table <-> I.void 0 1 <-> status_bar) in
+    let final_table = I.(table <-> I.void 0 1 <-> help_bar) in
     I.crop ~l:0 ~t:0 ~r:(max 0 (I.width final_table - w)) ~b:(max 0 (I.height final_table - h)) final_table
 end

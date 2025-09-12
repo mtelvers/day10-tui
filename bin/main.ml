@@ -188,7 +188,7 @@ let draw_home_view { commits; selected_commit; scroll_offset } (w, h) =
         selected_item = selected_commit;
         scroll_offset;
         title = "Select a commit to analyze:";
-        help_text = "↑/↓: navigate, Enter: select/download, q: quit";
+        help_text = "↑/↓: navigate, PgUp/PgDn: page, Home/End: first/last, Enter: select/download, q: quit";
       }
   in
 
@@ -228,7 +228,7 @@ let draw_detail_view detail (w, h) =
         header_attr = A.(fg white ++ st bold);
         sections = [ build_log_section; solution_section ];
         scroll_offset = detail.detail_scroll;
-        help_text = "↑/↓: scroll, Esc/q: back to table";
+        help_text = "↑/↓: scroll, PgUp/PgDn: page, Home/End: top/bottom, Esc/q: back to table";
       }
   in
 
@@ -258,6 +258,7 @@ let draw_table state (w, h) =
       selected_col = Some state.selected_x;
       scroll_row = state.scroll_y;
       scroll_col = state.scroll_x;
+      help_text = "Arrows: move, PgUp/PgDn: page, Home/End: first/last row, Enter: details, h: home, q: quit";
     }
   in
 
@@ -281,6 +282,30 @@ let handle_home_event term state home event =
       let content_height = snd (Term.size term) - 3 in
       let new_scroll = if new_selected >= home.scroll_offset + content_height then new_selected - content_height + 1 else home.scroll_offset in
       let new_home = { home with selected_commit = new_selected; scroll_offset = new_scroll } in
+      `Continue { state with mode = Home_view new_home }
+  | `Key (`Page `Up, []) ->
+      let content_height = snd (Term.size term) - 3 in
+      let page_size = max 1 (content_height - 1) in
+      let new_selected = max 0 (home.selected_commit - page_size) in
+      let new_scroll = max 0 (min new_selected home.scroll_offset) in
+      let new_home = { home with selected_commit = new_selected; scroll_offset = new_scroll } in
+      `Continue { state with mode = Home_view new_home }
+  | `Key (`Page `Down, []) ->
+      let max_idx = List.length home.commits - 1 in
+      let content_height = snd (Term.size term) - 3 in
+      let page_size = max 1 (content_height - 1) in
+      let new_selected = min max_idx (home.selected_commit + page_size) in
+      let new_scroll = if new_selected >= home.scroll_offset + content_height then new_selected - content_height + 1 else home.scroll_offset in
+      let new_home = { home with selected_commit = new_selected; scroll_offset = new_scroll } in
+      `Continue { state with mode = Home_view new_home }
+  | `Key (`Home, []) ->
+      let new_home = { home with selected_commit = 0; scroll_offset = 0 } in
+      `Continue { state with mode = Home_view new_home }
+  | `Key (`End, []) ->
+      let max_idx = List.length home.commits - 1 in
+      let content_height = snd (Term.size term) - 3 in
+      let new_scroll = max 0 (max_idx - content_height + 1) in
+      let new_home = { home with selected_commit = max_idx; scroll_offset = new_scroll } in
       `Continue { state with mode = Home_view new_home }
   | `Key (`Enter, []) -> (
       match List.nth home.commits home.selected_commit with
@@ -320,6 +345,28 @@ let handle_detail_event term state detail event =
       let new_scroll = min max_scroll (detail.detail_scroll + 1) in
       let new_detail = { detail with detail_scroll = new_scroll } in
       `Continue { state with mode = Detail_view new_detail }
+  | `Key (`Page `Up, []) ->
+      let content_height = snd (Term.size term) - 3 in
+      let page_size = max 1 (content_height - 1) in
+      let new_scroll = max 0 (detail.detail_scroll - page_size) in
+      let new_detail = { detail with detail_scroll = new_scroll } in
+      `Continue { state with mode = Detail_view new_detail }
+  | `Key (`Page `Down, []) ->
+      let total_lines = List.length detail.log_lines + List.length detail.solution_lines + 4 in
+      let max_scroll = max 0 (total_lines - (snd (Term.size term) - 3)) in
+      let content_height = snd (Term.size term) - 3 in
+      let page_size = max 1 (content_height - 1) in
+      let new_scroll = min max_scroll (detail.detail_scroll + page_size) in
+      let new_detail = { detail with detail_scroll = new_scroll } in
+      `Continue { state with mode = Detail_view new_detail }
+  | `Key (`Home, []) ->
+      let new_detail = { detail with detail_scroll = 0 } in
+      `Continue { state with mode = Detail_view new_detail }
+  | `Key (`End, []) ->
+      let total_lines = List.length detail.log_lines + List.length detail.solution_lines + 4 in
+      let max_scroll = max 0 (total_lines - (snd (Term.size term) - 3)) in
+      let new_detail = { detail with detail_scroll = max_scroll } in
+      `Continue { state with mode = Detail_view new_detail }
   | `Key (`Escape, [])
   | `Key (`ASCII 'q', []) ->
       `Continue { state with mode = Table_view }
@@ -352,6 +399,25 @@ let handle_table_event term state event =
       let visible_compilers = (term_width - 30) / 15 in
       let new_scroll_x = if new_x >= state.scroll_x + visible_compilers then new_x - visible_compilers + 1 else state.scroll_x in
       `Continue { state with selected_x = new_x; scroll_x = new_scroll_x }
+  | `Key (`Page `Up, []) ->
+      let term_height = snd (Term.size term) - 4 in
+      let page_size = max 1 (term_height - 1) in
+      let new_y = max 0 (state.selected_y - page_size) in
+      let new_scroll_y = max 0 (min new_y state.scroll_y) in
+      `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
+  | `Key (`Page `Down, []) ->
+      let max_y = List.length state.packages - 1 in
+      let term_height = snd (Term.size term) - 4 in
+      let page_size = max 1 (term_height - 1) in
+      let new_y = min max_y (state.selected_y + page_size) in
+      let new_scroll_y = if new_y >= state.scroll_y + term_height then new_y - term_height + 1 else state.scroll_y in
+      `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
+  | `Key (`Home, []) -> `Continue { state with selected_y = 0; scroll_y = 0 }
+  | `Key (`End, []) ->
+      let max_y = List.length state.packages - 1 in
+      let term_height = snd (Term.size term) - 4 in
+      let new_scroll_y = max 0 (max_y - term_height + 1) in
+      `Continue { state with selected_y = max_y; scroll_y = new_scroll_y }
   | `Key (`Enter, []) -> (
       let package = List.nth_exn state.packages state.selected_y in
       let compiler = List.nth_exn state.compilers state.selected_x in
