@@ -1,1 +1,1 @@
-(vendored_dirs ocaml-arrow notty)
+(vendored_dirs arrow notty)

@@ -19,7 +19,7 @@
  (name day10-tui)
  (synopsis "A short synopsis")
  (description "A longer description")
- (depends ocaml ctypes ctypes-foreign base core_kernel stdio)
+ (depends ocaml ctypes ctypes-foreign ptime)
  (tags
   ("add topics" "to describe" your project)))
 

@@ -1,6 +1,3 @@
-open Arrow_c_api
-open Stdio
-open Base
 open Notty
 open Day10_tui_lib
 
@@ -14,24 +11,10 @@ type commit_info = {
   downloaded : bool;
 }
 
-module Build_key = struct
-  type t = {
-    package : string;
-    compiler : string;
-  }
-
-  let create ~package ~compiler = { package; compiler }
-
-  let compare k1 k2 =
-    match String.compare k1.package k2.package with
-    | 0 -> String.compare k1.compiler k2.compiler
-    | n -> n
-
-  let hash { package; compiler } = Base.Hashtbl.hash (package, compiler)
-  let sexp_of_t { package; compiler } = Base.Sexp.List [ Base.Sexp.Atom package; Base.Sexp.Atom compiler ]
-end
-
-type build_key = Build_key.t
+type build_key = {
+  package : string;
+  compiler : string;
+}
 
 type build_result = {
   status : string;
@@ -78,8 +61,8 @@ let get_git_commits opam_repo_path =
       try
         let rec read_lines acc =
           try
-            let line = Stdio.In_channel.input_line_exn ic in
-            let parts = String.split line ~on:'|' in
+            let line = input_line ic in
+            let parts = String.split_on_char '|' line in
             match parts with
             | [ sha; message; date ] ->
                 let commit = { sha; message; date; downloaded = Stdlib.Sys.file_exists (sha ^ ".parquet") } in
@@ -101,14 +84,14 @@ let get_git_commits opam_repo_path =
     match result with
     | `Success commits -> commits
     | `Error msg ->
-        printf "Warning: %s\n" msg;
+        Printf.printf "Warning: %s\n" msg;
         []
   with
   | Unix.Unix_error (error, _, _) ->
-      printf "Error accessing git repository: %s\n" (Unix.error_message error);
+      Printf.printf "Error accessing git repository: %s\n" (Unix.error_message error);
       []
   | exn ->
-      printf "Unexpected error getting git commits: %s\n" (Exn.to_string exn);
+      Printf.printf "Unexpected error getting git commits: %s\n" (Printexc.to_string exn);
       []
 
 let download_parquet sha =
@@ -133,28 +116,28 @@ let download_parquet sha =
   else `Success
 
 let analyze_data filename =
-  let table = Parquet_reader.table filename in
-  let name_col = Wrapper.Column.read_utf8_opt table ~column:(`Name "name") in
-  let status_col = Wrapper.Column.read_utf8_opt table ~column:(`Name "status") in
-  let compiler_col = Wrapper.Column.read_utf8_opt table ~column:(`Name "compiler") in
-  let log_col = Wrapper.Column.read_utf8_opt table ~column:(`Name "log") in
-  let solution_col = Wrapper.Column.read_utf8_opt table ~column:(`Name "solution") in
+  let table = Arrow2.Parquet_reader.table filename in
+  let name_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "name") in
+  let status_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "status") in
+  let compiler_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "compiler") in
+  let log_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "log") in
+  let solution_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "solution") in
 
   (* Get unique values, filtering out None values *)
-  let extract_non_null arr = Array.filter_map arr ~f:(fun x -> x) |> Array.to_list in
+  let extract_non_null arr = Array.fold_right (fun x acc -> match x with Some v -> v :: acc | None -> acc) arr [] in
 
-  let unique_packages = extract_non_null name_col |> Set.of_list (module String) |> Set.to_list in
-  let unique_compilers = extract_non_null compiler_col |> Set.of_list (module String) |> Set.to_list in
+  let unique_packages = List.sort_uniq String.compare (extract_non_null name_col) in
+  let unique_compilers = List.sort_uniq String.compare (extract_non_null compiler_col) in
 
   (* Create a lookup map: (package, compiler) -> (status, log, solution) *)
-  let build_map = Hashtbl.create (module Build_key) in
-  Array.iteri name_col ~f:(fun i name_opt ->
+  let build_map = Hashtbl.create 1000 in
+  Array.iteri (fun i name_opt ->
       match (name_opt, status_col.(i), compiler_col.(i), log_col.(i), solution_col.(i)) with
       | Some package, Some status, Some compiler, log, solution ->
-          let key = Build_key.create ~package ~compiler in
+          let key = { package; compiler } in
           let result = { status; log; solution } in
-          Hashtbl.set build_map ~key ~data:result
-      | _ -> ());
+          Hashtbl.replace build_map key result
+      | _ -> ()) name_col;
 
   (build_map, unique_packages, unique_compilers)
 
@@ -174,11 +157,12 @@ let status_char = function
 
 let draw_home_view { commits; selected_commit; scroll_offset } (w, h) =
   let list_items =
-    List.map commits ~f:(fun commit ->
+    List.map (fun commit ->
         let download_indicator = if commit.downloaded then Some "✓" else Some "○" in
-        let short_sha = String.prefix commit.sha 8 in
-        let display_text = Printf.sprintf "%s %s - %s" short_sha commit.date (String.prefix commit.message 60) in
-        Day10_tui_lib.List_widget.List.{ content = commit; display_text; status_indicator = download_indicator; attr = A.(fg white) })
+        let short_sha = String.sub commit.sha 0 (min 8 (String.length commit.sha)) in
+        let message_truncated = if String.length commit.message > 60 then String.sub commit.message 0 60 else commit.message in
+        let display_text = Printf.sprintf "%s %s - %s" short_sha commit.date message_truncated in
+        Day10_tui_lib.List_widget.List.{ content = commit; display_text; status_indicator = download_indicator; attr = A.(fg white) }) commits
   in
 
   let config =
@@ -238,8 +222,8 @@ let draw_table state (w, h) =
   let get_cell ~row ~column =
     if String.equal column "_row_name" then { Table_widget.Table.text = row; attr = A.(fg white) }
     else
-      let key = Build_key.create ~package:row ~compiler:column in
-      match Hashtbl.find state.build_map key with
+      let key = { package = row; compiler = column } in
+      match Hashtbl.find_opt state.build_map key with
       | Some result ->
           let color = status_color result.status in
           let char = status_char result.status in
@@ -265,9 +249,9 @@ let draw_table state (w, h) =
   Table_widget.Table.draw_table config (w, h)
 
 let sanitize_text text =
-  String.map text ~f:(fun c ->
-      let code = Char.to_int c in
-      if code < 32 && code <> 10 then ' ' else c)
+  String.map (fun c ->
+      let code = Char.code c in
+      if code < 32 && code <> 10 then ' ' else c) text
 
 let handle_home_event term state home event =
   match event with
@@ -308,7 +292,7 @@ let handle_home_event term state home event =
       let new_home = { home with selected_commit = max_idx; scroll_offset = new_scroll } in
       `Continue { state with mode = Home_view new_home }
   | `Key (`Enter, []) -> (
-      match List.nth home.commits home.selected_commit with
+      match List.nth_opt home.commits home.selected_commit with
       | Some commit -> (
           let filename = commit.sha ^ ".parquet" in
           match download_parquet commit.sha with
@@ -319,7 +303,7 @@ let handle_home_event term state home event =
                 `Continue new_state
               with
               | exn ->
-                  let raw_error = Exn.to_string exn in
+                  let raw_error = Printexc.to_string exn in
                   let clean_error = sanitize_text raw_error in
                   let error_msg = Printf.sprintf "Failed to parse parquet file: %s" clean_error in
                   show_error_message term error_msg;
@@ -419,24 +403,24 @@ let handle_table_event term state event =
       let new_scroll_y = max 0 (max_y - term_height + 1) in
       `Continue { state with selected_y = max_y; scroll_y = new_scroll_y }
   | `Key (`Enter, []) -> (
-      let package = List.nth_exn state.packages state.selected_y in
-      let compiler = List.nth_exn state.compilers state.selected_x in
-      let key = Build_key.create ~package ~compiler in
-      match Hashtbl.find state.build_map key with
+      let package = List.nth state.packages state.selected_y in
+      let compiler = List.nth state.compilers state.selected_x in
+      let key = { package; compiler } in
+      (match Hashtbl.find_opt state.build_map key with
       | Some result ->
           let log_lines =
             match result.log with
-            | Some log when String.length log > 0 -> String.split_lines (sanitize_text log)
+            | Some log when String.length log > 0 -> String.split_on_char '\n' (sanitize_text log)
             | _ -> []
           in
           let solution_lines =
             match result.solution with
-            | Some solution when String.length solution > 0 -> String.split_lines (sanitize_text solution)
+            | Some solution when String.length solution > 0 -> String.split_on_char '\n' (sanitize_text solution)
             | _ -> []
           in
           let detail = { key; result; log_lines; solution_lines; detail_scroll = 0 } in
           `Continue { state with mode = Detail_view detail }
-      | None -> `Continue state)
+      | None -> `Continue state))
   | `Key (`ASCII 'q', [])
   | `Key (`Escape, []) ->
       `Quit
@@ -469,23 +453,23 @@ let () =
   let opam_repo_path = if Array.length Stdlib.Sys.argv > 1 then Stdlib.Sys.argv.(1) else Stdlib.Sys.getenv "HOME" ^ "/opam-repository" in
 
   try
-    printf "\n=== Starting TUI ===\n";
-    printf "Using opam repository: %s\n" opam_repo_path;
+    Printf.printf "\n=== Starting TUI ===\n";
+    Printf.printf "Using opam repository: %s\n" opam_repo_path;
 
     let commits = get_git_commits opam_repo_path in
     if List.is_empty commits then (
-      printf "Error: No git commits found in %s\n" opam_repo_path;
-      printf "Please ensure:\n";
-      printf "1. The path points to a valid git repository\n";
-      printf "2. You have read access to the repository\n";
-      printf "3. The repository has commit history\n";
+      Printf.printf "Error: No git commits found in %s\n" opam_repo_path;
+      Printf.printf "Please ensure:\n";
+      Printf.printf "1. The path points to a valid git repository\n";
+      Printf.printf "2. You have read access to the repository\n";
+      Printf.printf "3. The repository has commit history\n";
       Stdlib.exit 1);
     let term = Term.create () in
     let home = { commits; selected_commit = 0; scroll_offset = 0 } in
     let state =
       {
         opam_repo_path;
-        build_map = Hashtbl.create (module Build_key);
+        build_map = Hashtbl.create 1000;
         packages = [];
         compilers = [];
         scroll_x = 0;
@@ -499,4 +483,4 @@ let () =
     event_loop term state;
     Term.release term
   with
-  | exn -> printf "Error: %s\n" (Exn.to_string exn)
+  | exn -> Printf.printf "Error: %s\n" (Printexc.to_string exn)
