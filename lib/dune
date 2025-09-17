@@ -1,4 +1,4 @@
 (library
  (public_name day10-tui.lib)
  (name day10_tui_lib)
- (libraries base notty notty.unix stdio))
+ (libraries notty notty.unix))

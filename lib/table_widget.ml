@@ -1,4 +1,3 @@
-open Base
 module A = Notty.A
 module I = Notty.I
 
@@ -10,8 +9,8 @@ module Table = struct
   }
 
   type 'a table_config = {
-    rows : 'a list;
-    columns : string list;
+    rows : 'a array;
+    columns : string array;
     get_cell : row:'a -> column:string -> cell_content;
     row_height : int;
     column_width : int;
@@ -37,16 +36,22 @@ module Table = struct
 
     (* Calculate visible columns and rows *)
     let package_width = 30 in
-    let visible_columns = min (List.length config.columns) ((available_width - package_width) / config.column_width) in
-    let visible_rows = min (List.length config.rows) available_height in
+    let total_columns = Array.length config.columns in
+    let total_rows = Array.length config.rows in
+    let visible_columns = min total_columns ((available_width - package_width) / config.column_width) in
+    let visible_rows = min total_rows available_height in
 
-    let visible_column_list = List.drop config.columns config.scroll_col |> fun l -> List.take l visible_columns in
+    let col_start = min config.scroll_col total_columns in
+    let col_end = min (col_start + visible_columns) total_columns in
+    let row_start = min config.scroll_row total_rows in
+    let row_end = min (row_start + visible_rows) total_rows in
 
-    let visible_row_list = List.drop config.rows config.scroll_row |> fun l -> List.take l visible_rows in
+    let visible_column_list = Array.sub config.columns col_start (col_end - col_start) in
+    let visible_row_list = Array.sub config.rows row_start (row_end - row_start) in
 
     (* Create header *)
     let column_headers =
-      List.mapi visible_column_list ~f:(fun i column ->
+      Array.mapi (fun i column ->
           let selected =
             match config.selected_col with
             | Some sel_col -> i + config.scroll_col = sel_col
@@ -55,21 +60,21 @@ module Table = struct
           let attr = if selected then A.(fg black ++ bg white) else A.(fg cyan) in
           (* Extract version after first dot, or use full name if no dot *)
           let display_name =
-            match String.index column '.' with
-            | Some dot_pos -> String.drop_prefix column (dot_pos + 1)
+            match String.index_from_opt column 0 '.' with
+            | Some dot_pos -> String.sub column (dot_pos + 1) (String.length column - dot_pos - 1)
             | None -> column
           in
-          padding display_name config.column_width attr)
+          padding display_name config.column_width attr) visible_column_list
     in
 
     let row_header = I.string A.(fg white ++ st bold) "Package" |> I.hpad (package_width - 7) 0 in
     (* "Package" is 7 chars, left-aligned *)
 
-    let header = List.fold column_headers ~init:row_header ~f:I.( <|> ) in
+    let header = Array.fold_left I.( <|> ) row_header column_headers in
 
     (* Create rows *)
     let data_rows =
-      List.mapi visible_row_list ~f:(fun i row ->
+      Array.mapi (fun i row ->
           let selected_row =
             match config.selected_row with
             | Some sel_row -> i + config.scroll_row = sel_row
@@ -79,11 +84,14 @@ module Table = struct
           (* First cell is the row identifier *)
           let row_name = config.get_cell ~row ~column:"_row_name" in
           let row_attr = if selected_row then A.(fg black ++ bg white) else row_name.attr in
-          let truncated_row = String.prefix row_name.text (package_width - 1) in
+          let truncated_row =
+            let max_len = package_width - 1 in
+            if String.length row_name.text <= max_len then row_name.text
+            else String.sub row_name.text 0 max_len in
           let row_cell = I.string row_attr truncated_row |> I.hpad (package_width - String.length truncated_row) 0 in
 
           let data_cells =
-            List.mapi visible_column_list ~f:(fun j column ->
+            Array.mapi (fun j column ->
                 let selected_cell =
                   selected_row
                   &&
@@ -94,13 +102,13 @@ module Table = struct
                 let cell_data = config.get_cell ~row ~column in
                 let bg_attr = if selected_cell then A.(bg white) else A.empty in
                 let final_attr = A.(cell_data.attr ++ bg_attr) in
-                padding cell_data.text config.column_width final_attr)
+                padding cell_data.text config.column_width final_attr) visible_column_list
           in
 
-          List.fold data_cells ~init:row_cell ~f:I.( <|> ))
+          Array.fold_left I.( <|> ) row_cell data_cells) visible_row_list
     in
 
-    let table = List.fold data_rows ~init:header ~f:I.( <-> ) in
+    let table = Array.fold_left I.( <-> ) header data_rows in
 
     (* Add help bar *)
     let help_bar = I.string A.(fg black ++ bg white) config.help_text in

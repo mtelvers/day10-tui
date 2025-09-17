@@ -1,4 +1,3 @@
-open Base
 module A = Notty.A
 module I = Notty.I
 
@@ -24,10 +23,17 @@ module List = struct
     let content_height = h - 3 in
     (* Reserve space for header and help *)
 
-    let visible_items = List.drop config.items config.scroll_offset |> fun l -> List.take l content_height in
+    let visible_items =
+      let rec drop n lst = match n, lst with
+        | 0, _ | _, [] -> lst
+        | n, _ :: tl -> drop (n-1) tl in
+      let rec take n lst = match n, lst with
+        | 0, _ | _, [] -> []
+        | n, hd :: tl -> hd :: take (n-1) tl in
+      drop config.scroll_offset config.items |> take content_height in
 
     let item_lines =
-      List.mapi visible_items ~f:(fun i item ->
+      List.mapi (fun i item ->
           let idx = config.scroll_offset + i in
           let selected = idx = config.selected_item in
           let attr = if selected then A.(fg black ++ bg white) else item.attr in
@@ -39,8 +45,11 @@ module List = struct
           in
 
           (* Truncate to fit terminal width with some margin *)
-          let truncated = String.prefix line_text (max 10 (w - 4)) in
-          I.string attr truncated)
+          let truncated =
+            let max_len = max 10 (w - 4) in
+            if String.length line_text <= max_len then line_text
+            else String.sub line_text 0 max_len in
+          I.string attr truncated) visible_items
     in
 
     let content = I.vcat item_lines in

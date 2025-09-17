@@ -1,4 +1,3 @@
-open Base
 module A = Notty.A
 module I = Notty.I
 
@@ -31,9 +30,9 @@ module Dialog = struct
 
   let sanitize_text text =
     (* Remove all control characters (including tabs and newlines) and replace with spaces *)
-    String.map text ~f:(fun c ->
-        let code = Char.to_int c in
-        if code < 32 then ' ' (* Replace all control chars with spaces *) else c)
+    String.map (fun c ->
+        let code = Char.code c in
+        if code < 32 then ' ' (* Replace all control chars with spaces *) else c) text
 
   let draw_dialog config (w, h) =
     let title_attr = dialog_colors config.dialog_type in
@@ -53,18 +52,18 @@ module Dialog = struct
     let message_lines =
       if String.length clean_message <= message_width then [ clean_message ]
       else
-        let words = String.split clean_message ~on:' ' in
+        let words = String.split_on_char ' ' clean_message in
         let fold_word (lines, current_line) word =
-          let new_line = if String.is_empty current_line then word else current_line ^ " " ^ word in
+          let new_line = if current_line = "" then word else current_line ^ " " ^ word in
           if String.length new_line <= message_width then (lines, new_line)
-          else if String.is_empty current_line then ([ word ], "") (* Handle very long single words *)
+          else if current_line = "" then ([ word ], "") (* Handle very long single words *)
           else (lines @ [ current_line ], word)
         in
-        let lines, final_line = List.fold words ~init:([], "") ~f:fold_word in
-        if String.is_empty final_line then lines else lines @ [ final_line ]
+        let lines, final_line = List.fold_left fold_word ([], "") words in
+        if final_line = "" then lines else lines @ [ final_line ]
     in
 
-    let message_imgs = List.map message_lines ~f:(I.string A.(fg white)) in
+    let message_imgs = List.map (I.string A.(fg white)) message_lines in
     let message = I.vcat message_imgs in
 
     let help = I.string A.(fg black ++ bg white) (sanitize_text config.help_text) in

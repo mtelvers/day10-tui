@@ -44,8 +44,8 @@ type app_mode =
 type tui_state = {
   opam_repo_path : string;
   build_map : (build_key, build_result) Hashtbl.t;
-  packages : string list;
-  compilers : string list;
+  packages : string array;
+  compilers : string array;
   scroll_x : int; (* horizontal scroll for compilers *)
   scroll_y : int; (* vertical scroll for packages *)
   selected_x : int; (* selected compiler column *)
@@ -117,23 +117,22 @@ let download_parquet sha =
 
 let analyze_data filename =
   let table = Arrow2.Parquet_reader.table filename in
-  let name_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "name") in
+  let name_col = Arrow2.Wrapper.Column.read_utf8 table ~column:(`Name "name") in
   let status_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "status") in
-  let compiler_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "compiler") in
+  let compiler_col = Arrow2.Wrapper.Column.read_utf8 table ~column:(`Name "compiler") in
   let log_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "log") in
   let solution_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "solution") in
 
-  (* Get unique values, filtering out None values *)
-  let extract_non_null arr = Array.fold_right (fun x acc -> match x with Some v -> v :: acc | None -> acc) arr [] in
-
-  let unique_packages = List.sort_uniq String.compare (extract_non_null name_col) in
-  let unique_compilers = List.sort_uniq String.compare (extract_non_null compiler_col) in
+  (* Package names and compilers are unique and non-null, data is likely pre-sorted *)
+  let unique_packages = name_col in
+  let unique_compilers = compiler_col in
 
   (* Create a lookup map: (package, compiler) -> (status, log, solution) *)
   let build_map = Hashtbl.create 1000 in
-  Array.iteri (fun i name_opt ->
-      match (name_opt, status_col.(i), compiler_col.(i), log_col.(i), solution_col.(i)) with
-      | Some package, Some status, Some compiler, log, solution ->
+  Array.iteri (fun i package ->
+      let compiler = compiler_col.(i) in
+      match (status_col.(i), log_col.(i), solution_col.(i)) with
+      | Some status, log, solution ->
           let key = { package; compiler } in
           let result = { status; log; solution } in
           Hashtbl.replace build_map key result
@@ -367,7 +366,7 @@ let handle_table_event term state event =
       let new_scroll_y = if new_y < state.scroll_y then new_y else state.scroll_y in
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Arrow `Down, []) ->
-      let max_y = List.length state.packages - 1 in
+      let max_y = Array.length state.packages - 1 in
       let new_y = min max_y (state.selected_y + 1) in
       let term_height = snd (Term.size term) - 4 in
       let new_scroll_y = if new_y >= state.scroll_y + term_height then new_y - term_height + 1 else state.scroll_y in
@@ -377,7 +376,7 @@ let handle_table_event term state event =
       let new_scroll_x = if new_x < state.scroll_x then new_x else state.scroll_x in
       `Continue { state with selected_x = new_x; scroll_x = new_scroll_x }
   | `Key (`Arrow `Right, []) ->
-      let max_x = List.length state.compilers - 1 in
+      let max_x = Array.length state.compilers - 1 in
       let new_x = min max_x (state.selected_x + 1) in
       let term_width = fst (Term.size term) in
       let visible_compilers = (term_width - 30) / 15 in
@@ -390,7 +389,7 @@ let handle_table_event term state event =
       let new_scroll_y = max 0 (min new_y state.scroll_y) in
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Page `Down, []) ->
-      let max_y = List.length state.packages - 1 in
+      let max_y = Array.length state.packages - 1 in
       let term_height = snd (Term.size term) - 4 in
       let page_size = max 1 (term_height - 1) in
       let new_y = min max_y (state.selected_y + page_size) in
@@ -398,13 +397,13 @@ let handle_table_event term state event =
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Home, []) -> `Continue { state with selected_y = 0; scroll_y = 0 }
   | `Key (`End, []) ->
-      let max_y = List.length state.packages - 1 in
+      let max_y = Array.length state.packages - 1 in
       let term_height = snd (Term.size term) - 4 in
       let new_scroll_y = max 0 (max_y - term_height + 1) in
       `Continue { state with selected_y = max_y; scroll_y = new_scroll_y }
   | `Key (`Enter, []) -> (
-      let package = List.nth state.packages state.selected_y in
-      let compiler = List.nth state.compilers state.selected_x in
+      let package = state.packages.(state.selected_y) in
+      let compiler = state.compilers.(state.selected_x) in
       let key = { package; compiler } in
       (match Hashtbl.find_opt state.build_map key with
       | Some result ->
@@ -470,8 +469,8 @@ let () =
       {
         opam_repo_path;
         build_map = Hashtbl.create 1000;
-        packages = [];
-        compilers = [];
+        packages = [||];
+        compilers = [||];
         scroll_x = 0;
         scroll_y = 0;
         selected_x = 0;

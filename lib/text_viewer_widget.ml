@@ -1,4 +1,3 @@
-open Base
 module A = Notty.A
 module I = Notty.I
 
@@ -23,19 +22,21 @@ module TextViewer = struct
     let header_img = I.string config.header_attr config.header in
 
     let all_lines =
-      List.fold config.sections ~init:[] ~f:(fun acc section ->
+      List.fold_left (fun acc section ->
           let section_header = I.string section.title_attr section.title in
           let section_content =
-            if List.is_empty section.lines then [ I.string A.(fg yellow) ("No " ^ String.lowercase section.title ^ " available") ]
-            else List.map section.lines ~f:(I.string section.line_attr)
+            if section.lines = [] then [ I.string A.(fg yellow) ("No " ^ String.lowercase_ascii section.title ^ " available") ]
+            else List.map (I.string section.line_attr) section.lines
           in
-          let spacing = if List.is_empty acc then [] else [ I.void 0 1 ] in
-          acc @ spacing @ [ section_header ] @ section_content)
+          let spacing = if acc = [] then [] else [ I.void 0 1 ] in
+          acc @ spacing @ [ section_header ] @ section_content) [] config.sections
     in
 
     let content_height = h - 3 in
     (* Reserve space for header and help *)
-    let visible_lines = List.drop all_lines config.scroll_offset |> fun l -> List.take l content_height in
+    let rec drop n lst = match n, lst with | 0, _ | _, [] -> lst | n, _ :: tl -> drop (n-1) tl in
+    let rec take n lst = match n, lst with | 0, _ | _, [] -> [] | n, hd :: tl -> hd :: take (n-1) tl in
+    let visible_lines = drop config.scroll_offset all_lines |> take content_height in
     let content = I.vcat visible_lines in
 
     let help_msg = I.string A.(fg black ++ bg white) config.help_text in
