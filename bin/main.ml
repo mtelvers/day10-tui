@@ -116,12 +116,12 @@ let download_parquet sha =
   else `Success
 
 let analyze_data filename =
-  let table = Arrow2.Parquet_reader.table filename in
-  let name_col = Arrow2.Wrapper.Column.read_utf8 table ~column:(`Name "name") in
-  let status_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "status") in
-  let compiler_col = Arrow2.Wrapper.Column.read_utf8 table ~column:(`Name "compiler") in
-  let log_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "log") in
-  let solution_col = Arrow2.Wrapper.Column.read_utf8_opt table ~column:(`Name "solution") in
+  let table = Arrow.Parquet_reader.table filename in
+  let name_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "name") in
+  let status_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "status") in
+  let compiler_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "compiler") in
+  let log_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "log") in
+  let solution_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "solution") in
 
   (* Package names and compilers are unique and non-null, data is likely pre-sorted *)
   let unique_packages = name_col in

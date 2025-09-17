@@ -14,9 +14,7 @@ depends: [
   "ocaml"
   "ctypes"
   "ctypes-foreign"
-  "base"
-  "core_kernel"
-  "stdio"
+  "ptime"
   "odoc" {with-doc}
 ]
 build: [
