@@ -1,4 +1,4 @@
 (executable
  (public_name day10-tui)
  (name main)
- (libraries arrow notty notty.unix day10_tui_lib))
+ (libraries arrow notty notty.unix day10_tui_lib cmdliner))

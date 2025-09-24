@@ -2,7 +2,7 @@ open Notty
 open Day10_tui_lib
 
 (* open Notty.Infix *)
-module Term = Notty_unix.Term
+module NottyTerm = Notty_unix.Term
 
 let column_width = 8
 
@@ -73,6 +73,7 @@ type app_mode =
 
 type tui_state = {
   opam_repo_path : string;
+  num_commits : int; (* Number of commits to show *)
   current_filename : string; (* Current parquet file being viewed *)
   build_map : (build_key, build_result) Hashtbl.t;
   full_data_loaded : bool; (* Whether the full log/solution data has been loaded *)
@@ -88,7 +89,7 @@ type tui_state = {
 (* Fetch and parse server directory listing to get available files *)
 let get_available_files () =
   let url = "https://www.cl.cam.ac.uk/~mte24/day10/" in
-  let cmd = Stdlib.Filename.quote_command "curl" [ "-s"; "-f"; url ] ~stderr:"/dev/null" in
+  let cmd = Filename.quote_command "curl" [ "-s"; "-f"; url ] ~stderr:"/dev/null" in
   try
     let ic = Unix.open_process_in cmd in
     let available_files = ref [] in
@@ -114,8 +115,54 @@ let get_available_files () =
     !available_files
   with _ -> []
 
-let get_git_commits opam_repo_path =
-  let cmd = Stdlib.Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "-n"; "50"; "--format=%H|%s|%ci" ] ~stderr:"/dev/null" in
+let fetch_repository opam_repo_path =
+  Printf.printf "Fetching latest changes from remote repository...\n";
+
+  (* Find the remote that points to https://github.com/ocaml/opam-repository *)
+  let remote_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "remote"; "-v" ] in
+  let remote =
+    try
+      let ic = Unix.open_process_in remote_cmd in
+      let rec find_official_remote () =
+        try
+          let line = input_line ic in
+          if String.strstr line "https://github.com/ocaml/opam-repository" <> None then (
+            (* Extract remote name (first word before whitespace) *)
+            match String.split_on_char '\t' line with
+            | remote_name :: _ -> Some remote_name
+            | [] ->
+                match String.split_on_char ' ' line with
+                | remote_name :: _ -> Some remote_name
+                | [] -> None
+          ) else
+            find_official_remote ()
+        with End_of_file -> None
+      in
+      let result = find_official_remote () in
+      let _ = Unix.close_process_in ic in
+      match result with
+      | Some r -> r
+      | None -> "origin" (* fallback *)
+    with _ -> "origin"
+  in
+
+  Printf.printf "Using remote: %s\n" remote;
+
+  let fetch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "fetch"; remote ] in
+  let fetch_exit = Sys.command fetch_cmd in
+  if fetch_exit = 0 then (
+    Printf.printf "Resetting to latest master...\n";
+    let reset_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "reset"; "--hard"; remote ^ "/master" ] in
+    let reset_exit = Sys.command reset_cmd in
+    if reset_exit = 0 then
+      Printf.printf "Repository updated successfully.\n"
+    else
+      Printf.printf "Warning: Failed to reset to %s/master\n" remote
+  ) else
+    Printf.printf "Warning: Failed to fetch from %s\n" remote
+
+let get_git_commits opam_repo_path num_commits =
+  let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci" ] ~stderr:"/dev/null" in
   try
     (* Get the list of available files from server once *)
     let available_files = get_available_files () in
@@ -130,7 +177,7 @@ let get_git_commits opam_repo_path =
             | [ sha; message; date ] ->
                 let filename = sha ^ ".parquet" in
                 let availability =
-                  if Stdlib.Sys.file_exists filename then
+                  if Sys.file_exists filename then
                     Downloaded
                   else if List.mem filename available_files then
                     Available
@@ -168,14 +215,14 @@ let get_git_commits opam_repo_path =
 
 let download_parquet sha =
   let filename = sha ^ ".parquet" in
-  if not (Stdlib.Sys.file_exists filename) then
+  if not (Sys.file_exists filename) then
     let url = Printf.sprintf "https://www.cl.cam.ac.uk/~mte24/day10/%s.parquet" sha in
-    let cmd = Stdlib.Filename.quote_command "curl" [ "-s"; "-f"; "-o"; filename; url ] ~stderr:"/dev/null" in
-    let exit_code = Stdlib.Sys.command cmd in
-    if exit_code = 0 && Stdlib.Sys.file_exists filename then `Success
+    let cmd = Filename.quote_command "curl" [ "-s"; "-f"; "-o"; filename; url ] ~stderr:"/dev/null" in
+    let exit_code = Sys.command cmd in
+    if exit_code = 0 && Sys.file_exists filename then `Success
     else (
       (* Clean up partial download *)
-      if Stdlib.Sys.file_exists filename then Stdlib.Sys.remove filename;
+      if Sys.file_exists filename then Sys.remove filename;
       let error_msg =
         match exit_code with
         | 22 -> "File not found on server"
@@ -358,12 +405,12 @@ let handle_home_event term state home event =
   | `Key (`Arrow `Down, []) ->
       let max_idx = List.length home.commits - 1 in
       let new_selected = min max_idx (home.selected_commit + 1) in
-      let content_height = snd (Term.size term) - 3 in
+      let content_height = snd (NottyTerm.size term) - 3 in
       let new_scroll = if new_selected >= home.scroll_offset + content_height then new_selected - content_height + 1 else home.scroll_offset in
       let new_home = { home with selected_commit = new_selected; scroll_offset = new_scroll } in
       `Continue { state with mode = Home_view new_home }
   | `Key (`Page `Up, []) ->
-      let content_height = snd (Term.size term) - 3 in
+      let content_height = snd (NottyTerm.size term) - 3 in
       let page_size = max 1 (content_height - 1) in
       let new_selected = max 0 (home.selected_commit - page_size) in
       let new_scroll = max 0 (min new_selected home.scroll_offset) in
@@ -371,7 +418,7 @@ let handle_home_event term state home event =
       `Continue { state with mode = Home_view new_home }
   | `Key (`Page `Down, []) ->
       let max_idx = List.length home.commits - 1 in
-      let content_height = snd (Term.size term) - 3 in
+      let content_height = snd (NottyTerm.size term) - 3 in
       let page_size = max 1 (content_height - 1) in
       let new_selected = min max_idx (home.selected_commit + page_size) in
       let new_scroll = if new_selected >= home.scroll_offset + content_height then new_selected - content_height + 1 else home.scroll_offset in
@@ -382,7 +429,7 @@ let handle_home_event term state home event =
       `Continue { state with mode = Home_view new_home }
   | `Key (`End, []) ->
       let max_idx = List.length home.commits - 1 in
-      let content_height = snd (Term.size term) - 3 in
+      let content_height = snd (NottyTerm.size term) - 3 in
       let new_scroll = max 0 (max_idx - content_height + 1) in
       let new_home = { home with selected_commit = max_idx; scroll_offset = new_scroll } in
       `Continue { state with mode = Home_view new_home }
@@ -420,20 +467,20 @@ let handle_detail_event term state detail event =
       `Continue { state with mode = Detail_view new_detail }
   | `Key (`Arrow `Down, []) ->
       let total_lines = List.length detail.log_lines + List.length detail.solution_lines + 4 in
-      let max_scroll = max 0 (total_lines - (snd (Term.size term) - 3)) in
+      let max_scroll = max 0 (total_lines - (snd (NottyTerm.size term) - 3)) in
       let new_scroll = min max_scroll (detail.detail_scroll + 1) in
       let new_detail = { detail with detail_scroll = new_scroll } in
       `Continue { state with mode = Detail_view new_detail }
   | `Key (`Page `Up, []) ->
-      let content_height = snd (Term.size term) - 3 in
+      let content_height = snd (NottyTerm.size term) - 3 in
       let page_size = max 1 (content_height - 1) in
       let new_scroll = max 0 (detail.detail_scroll - page_size) in
       let new_detail = { detail with detail_scroll = new_scroll } in
       `Continue { state with mode = Detail_view new_detail }
   | `Key (`Page `Down, []) ->
       let total_lines = List.length detail.log_lines + List.length detail.solution_lines + 4 in
-      let max_scroll = max 0 (total_lines - (snd (Term.size term) - 3)) in
-      let content_height = snd (Term.size term) - 3 in
+      let max_scroll = max 0 (total_lines - (snd (NottyTerm.size term) - 3)) in
+      let content_height = snd (NottyTerm.size term) - 3 in
       let page_size = max 1 (content_height - 1) in
       let new_scroll = min max_scroll (detail.detail_scroll + page_size) in
       let new_detail = { detail with detail_scroll = new_scroll } in
@@ -443,7 +490,7 @@ let handle_detail_event term state detail event =
       `Continue { state with mode = Detail_view new_detail }
   | `Key (`End, []) ->
       let total_lines = List.length detail.log_lines + List.length detail.solution_lines + 4 in
-      let max_scroll = max 0 (total_lines - (snd (Term.size term) - 3)) in
+      let max_scroll = max 0 (total_lines - (snd (NottyTerm.size term) - 3)) in
       let new_detail = { detail with detail_scroll = max_scroll } in
       `Continue { state with mode = Detail_view new_detail }
   | `Key (`Escape, [])
@@ -454,7 +501,7 @@ let handle_detail_event term state detail event =
 let handle_table_event term state event =
   match event with
   | `Key (`ASCII 'h', []) ->
-      let commits = get_git_commits state.opam_repo_path in
+      let commits = get_git_commits state.opam_repo_path state.num_commits in
       let home = { commits; selected_commit = 0; scroll_offset = 0 } in
       `Continue { state with mode = Home_view home }
   | `Key (`Arrow `Up, []) ->
@@ -464,7 +511,7 @@ let handle_table_event term state event =
   | `Key (`Arrow `Down, []) ->
       let max_y = Array.length state.packages - 1 in
       let new_y = min max_y (state.selected_y + 1) in
-      let term_height = snd (Term.size term) - 4 in
+      let term_height = snd (NottyTerm.size term) - 4 in
       let new_scroll_y = if new_y >= state.scroll_y + term_height then new_y - term_height + 1 else state.scroll_y in
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Arrow `Left, []) ->
@@ -474,19 +521,19 @@ let handle_table_event term state event =
   | `Key (`Arrow `Right, []) ->
       let max_x = Array.length state.compilers - 1 in
       let new_x = min max_x (state.selected_x + 1) in
-      let term_width = fst (Term.size term) in
+      let term_width = fst (NottyTerm.size term) in
       let visible_compilers = (term_width - 30) / column_width in
       let new_scroll_x = if new_x >= state.scroll_x + visible_compilers then new_x - visible_compilers + 1 else state.scroll_x in
       `Continue { state with selected_x = new_x; scroll_x = new_scroll_x }
   | `Key (`Page `Up, []) ->
-      let term_height = snd (Term.size term) - 4 in
+      let term_height = snd (NottyTerm.size term) - 4 in
       let page_size = max 1 (term_height - 1) in
       let new_y = max 0 (state.selected_y - page_size) in
       let new_scroll_y = max 0 (min new_y state.scroll_y) in
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Page `Down, []) ->
       let max_y = Array.length state.packages - 1 in
-      let term_height = snd (Term.size term) - 4 in
+      let term_height = snd (NottyTerm.size term) - 4 in
       let page_size = max 1 (term_height - 1) in
       let new_y = min max_y (state.selected_y + page_size) in
       let new_scroll_y = if new_y >= state.scroll_y + term_height then new_y - term_height + 1 else state.scroll_y in
@@ -494,7 +541,7 @@ let handle_table_event term state event =
   | `Key (`Home, []) -> `Continue { state with selected_y = 0; scroll_y = 0 }
   | `Key (`End, []) ->
       let max_y = Array.length state.packages - 1 in
-      let term_height = snd (Term.size term) - 4 in
+      let term_height = snd (NottyTerm.size term) - 4 in
       let new_scroll_y = max 0 (max_y - term_height + 1) in
       `Continue { state with selected_y = max_y; scroll_y = new_scroll_y }
   | `Key (`Enter, []) -> (
@@ -538,12 +585,12 @@ let handle_table_event term state event =
 let rec event_loop term state =
   let img =
     match state.mode with
-    | Home_view home -> draw_home_view home (Term.size term)
-    | Table_view -> draw_table state (Term.size term)
-    | Detail_view detail -> draw_detail_view detail (Term.size term)
+    | Home_view home -> draw_home_view home (NottyTerm.size term)
+    | Table_view -> draw_table state (NottyTerm.size term)
+    | Detail_view detail -> draw_detail_view detail (NottyTerm.size term)
   in
-  Term.image term img;
-  let event = Term.event term in
+  NottyTerm.image term img;
+  let event = NottyTerm.event term in
   let result =
     match (state.mode, event) with
     | Home_view home, event -> handle_home_event term state home event
@@ -558,26 +605,30 @@ let rec event_loop term state =
       | `Resize _ -> event_loop term state
       | _ -> event_loop term state)
 
-let () =
-  let opam_repo_path = if Array.length Stdlib.Sys.argv > 1 then Stdlib.Sys.argv.(1) else Stdlib.Sys.getenv "HOME" ^ "/opam-repository" in
+open Cmdliner
 
+let main_cmd opam_repo_path num_commits fetch_flag =
   try
     Printf.printf "\n=== Starting TUI ===\n";
     Printf.printf "Using opam repository: %s\n" opam_repo_path;
 
-    let commits = get_git_commits opam_repo_path in
+    if fetch_flag then
+      fetch_repository opam_repo_path;
+
+    let commits = get_git_commits opam_repo_path num_commits in
     if List.is_empty commits then (
       Printf.printf "Error: No git commits found in %s\n" opam_repo_path;
       Printf.printf "Please ensure:\n";
       Printf.printf "1. The path points to a valid git repository\n";
       Printf.printf "2. You have read access to the repository\n";
       Printf.printf "3. The repository has commit history\n";
-      Stdlib.exit 1);
-    let term = Term.create () in
+      exit 1);
+    let term = NottyTerm.create () in
     let home = { commits; selected_commit = 0; scroll_offset = 0 } in
     let state =
       {
         opam_repo_path;
+        num_commits;
         current_filename = "";  (* Will be set when a commit is selected *)
         build_map = Hashtbl.create 1000;
         full_data_loaded = false;
@@ -592,6 +643,25 @@ let () =
     in
 
     event_loop term state;
-    Term.release term
+    NottyTerm.release term
   with
   | exn -> Printf.printf "Error: %s\n" (Printexc.to_string exn)
+
+let opam_repo_arg =
+  let doc = "Path to the opam repository" in
+  Arg.(value & pos 0 string (Sys.getenv "HOME" ^ "/opam-repository") & info [] ~docv:"PATH" ~doc)
+
+let num_commits_arg =
+  let doc = "Number of commits to show in the table" in
+  Arg.(value & opt int 50 & info ["commits"] ~docv:"N" ~doc)
+
+let fetch_arg =
+  let doc = "Fetch latest changes from the remote repository before starting" in
+  Arg.(value & flag & info ["fetch"] ~doc)
+
+let cmd =
+  let doc = "Terminal UI for browsing opam repository build results" in
+  let info = Cmd.info "day10-tui" ~doc in
+  Cmd.v info Term.(const main_cmd $ opam_repo_arg $ num_commits_arg $ fetch_arg)
+
+let () = exit (Cmd.eval cmd)

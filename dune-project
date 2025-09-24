@@ -19,7 +19,7 @@
  (name day10-tui)
  (synopsis "A short synopsis")
  (description "A longer description")
- (depends ocaml ctypes ctypes-foreign ptime)
+ (depends ocaml ctypes ctypes-foreign ptime cmdliner)
  (tags
   ("add topics" "to describe" your project)))
 
