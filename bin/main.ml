@@ -4,6 +4,8 @@ open Day10_tui_lib
 (* open Notty.Infix *)
 module Term = Notty_unix.Term
 
+let column_width = 8
+
 type commit_info = {
   sha : string;
   message : string;
@@ -43,7 +45,9 @@ type app_mode =
 
 type tui_state = {
   opam_repo_path : string;
+  current_filename : string; (* Current parquet file being viewed *)
   build_map : (build_key, build_result) Hashtbl.t;
+  full_data_loaded : bool; (* Whether the full log/solution data has been loaded *)
   packages : string array;
   compilers : string array;
   scroll_x : int; (* horizontal scroll for compilers *)
@@ -116,29 +120,48 @@ let download_parquet sha =
   else `Success
 
 let analyze_data filename =
-  let table = Arrow.Parquet_reader.table filename in
+  (* Load only the columns needed for table view: name, status, compiler (skip log/solution) *)
+  let table = Arrow.Parquet_reader.table filename ~column_idxs:[0; 1; 6; 7] in
   let name_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "name") in
   let status_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "status") in
   let compiler_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "compiler") in
-  let log_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "log") in
-  let solution_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "solution") in
 
-  (* Package names and compilers are unique and non-null, data is likely pre-sorted *)
-  let unique_packages = name_col in
-  let unique_compilers = compiler_col in
+  (* Extract unique packages and compilers *)
+  let unique_packages = Array.of_list (List.sort_uniq String.compare (Array.to_list name_col)) in
+  let unique_compilers = Array.of_list (List.sort_uniq String.compare (Array.to_list compiler_col)) in
 
-  (* Create a lookup map: (package, compiler) -> (status, log, solution) *)
+  (* Create a lookup map: (package, compiler) -> status only (no log/solution yet) *)
   let build_map = Hashtbl.create 1000 in
   Array.iteri (fun i package ->
       let compiler = compiler_col.(i) in
-      match (status_col.(i), log_col.(i), solution_col.(i)) with
-      | Some status, log, solution ->
+      match status_col.(i) with
+      | Some status ->
           let key = { package; compiler } in
-          let result = { status; log; solution } in
+          let result = { status; log = None; solution = None } in
           Hashtbl.replace build_map key result
       | _ -> ()) name_col;
 
   (build_map, unique_packages, unique_compilers)
+
+(* Load full data including log and solution columns and update the hashtable *)
+let load_full_data filename build_map =
+  let table = Arrow.Parquet_reader.table filename in
+  let name_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "name") in
+  let compiler_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "compiler") in
+  let log_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "log") in
+  let solution_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "solution") in
+
+  (* Update the existing hashtable with log and solution data *)
+  Array.iteri (fun i package ->
+      let compiler = compiler_col.(i) in
+      let key = { package; compiler } in
+      match Hashtbl.find_opt build_map key with
+      | Some existing_result ->
+          let updated_result = { existing_result with log = log_col.(i); solution = solution_col.(i) } in
+          Hashtbl.replace build_map key updated_result
+      | None -> () (* Skip entries not in the original map *)
+  ) name_col
+
 
 let status_color = function
   | "success" -> A.fg A.green
@@ -236,7 +259,7 @@ let draw_table state (w, h) =
       columns = state.compilers;
       get_cell;
       row_height = 1;
-      column_width = 15;
+      column_width;
       selected_row = Some state.selected_y;
       selected_col = Some state.selected_x;
       scroll_row = state.scroll_y;
@@ -298,7 +321,7 @@ let handle_home_event term state home event =
           | `Success -> (
               try
                 let build_map, packages, compilers = analyze_data filename in
-                let new_state = { state with build_map; packages; compilers; mode = Table_view } in
+                let new_state = { state with current_filename = filename; build_map; packages; compilers; full_data_loaded = false; mode = Table_view } in
                 `Continue new_state
               with
               | exn ->
@@ -379,7 +402,7 @@ let handle_table_event term state event =
       let max_x = Array.length state.compilers - 1 in
       let new_x = min max_x (state.selected_x + 1) in
       let term_width = fst (Term.size term) in
-      let visible_compilers = (term_width - 30) / 15 in
+      let visible_compilers = (term_width - 30) / column_width in
       let new_scroll_x = if new_x >= state.scroll_x + visible_compilers then new_x - visible_compilers + 1 else state.scroll_x in
       `Continue { state with selected_x = new_x; scroll_x = new_scroll_x }
   | `Key (`Page `Up, []) ->
@@ -407,18 +430,32 @@ let handle_table_event term state event =
       let key = { package; compiler } in
       (match Hashtbl.find_opt state.build_map key with
       | Some result ->
+          (* If full data not loaded yet, load it and cache in hashtable *)
+          let updated_state =
+            if not state.full_data_loaded then (
+              load_full_data state.current_filename state.build_map;
+              { state with full_data_loaded = true }
+            ) else
+              state
+          in
+          (* Now get the updated result with log/solution data *)
+          let final_result =
+            match Hashtbl.find_opt updated_state.build_map key with
+            | Some r -> r
+            | None -> result (* fallback *)
+          in
           let log_lines =
-            match result.log with
+            match final_result.log with
             | Some log when String.length log > 0 -> String.split_on_char '\n' (sanitize_text log)
             | _ -> []
           in
           let solution_lines =
-            match result.solution with
+            match final_result.solution with
             | Some solution when String.length solution > 0 -> String.split_on_char '\n' (sanitize_text solution)
             | _ -> []
           in
-          let detail = { key; result; log_lines; solution_lines; detail_scroll = 0 } in
-          `Continue { state with mode = Detail_view detail }
+          let detail = { key; result = final_result; log_lines; solution_lines; detail_scroll = 0 } in
+          `Continue { updated_state with mode = Detail_view detail }
       | None -> `Continue state))
   | `Key (`ASCII 'q', [])
   | `Key (`Escape, []) ->
@@ -468,7 +505,9 @@ let () =
     let state =
       {
         opam_repo_path;
+        current_filename = "";  (* Will be set when a commit is selected *)
         build_map = Hashtbl.create 1000;
+        full_data_loaded = false;
         packages = [||];
         compilers = [||];
         scroll_x = 0;
