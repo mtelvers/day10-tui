@@ -6,6 +6,8 @@ module NottyTerm = Notty_unix.Term
 
 let column_width = 8
 
+module StringSet = Set.Make(String)
+
 module String = struct
   include String
   let strstr haystack needle =
@@ -64,12 +66,27 @@ type home_info = {
   commits : commit_info list;
   selected_commit : int;
   scroll_offset : int;
+  selected_commits : int list; (* List of selected commit indices for comparison *)
+}
+
+type package_diff =
+  | New_package of string * (string * string) list  (* package_name, (compiler, status) list *)
+  | Removed_package of string * (string * string) list
+  | Status_changed of string * (string * string * string) list (* package_name, (compiler, old_status, new_status) list *)
+
+type diff_info = {
+  selected_commits : commit_info list;
+  new_packages : package_diff list;
+  removed_packages : package_diff list;
+  status_changes : package_diff list;
+  diff_scroll : int;
 }
 
 type app_mode =
   | Home_view of home_info
   | Table_view
   | Detail_view of detail_info
+  | Diff_view of diff_info
 
 type tui_state = {
   opam_repo_path : string;
@@ -259,6 +276,62 @@ let analyze_data filename =
   (build_map, unique_packages, unique_compilers)
 
 (* Load full data including log and solution columns and update the hashtable *)
+(* Compare two build maps and generate diff information *)
+let compare_build_maps old_map old_packages old_compilers new_map new_packages new_compilers =
+  let old_package_set = Array.to_list old_packages |> List.fold_left (fun acc p -> StringSet.add p acc) StringSet.empty in
+  let new_package_set = Array.to_list new_packages |> List.fold_left (fun acc p -> StringSet.add p acc) StringSet.empty in
+
+  (* Find new and removed packages *)
+  let new_packages_list = StringSet.diff new_package_set old_package_set |> StringSet.elements in
+  let removed_packages_list = StringSet.diff old_package_set new_package_set |> StringSet.elements in
+
+  (* Find packages with status changes *)
+  let common_packages = StringSet.inter old_package_set new_package_set |> StringSet.elements in
+  let changed_packages = List.filter_map (fun package ->
+    let old_statuses = Array.to_list old_compilers |> List.filter_map (fun compiler ->
+      match Hashtbl.find_opt old_map { package; compiler } with
+      | Some result -> Some (compiler, result.status)
+      | None -> None
+    ) in
+    let new_statuses = Array.to_list new_compilers |> List.filter_map (fun compiler ->
+      match Hashtbl.find_opt new_map { package; compiler } with
+      | Some result -> Some (compiler, result.status)
+      | None -> None
+    ) in
+
+    let changes = List.filter_map (fun (compiler, new_status) ->
+      match List.assoc_opt compiler old_statuses with
+      | Some old_status when old_status <> new_status -> Some (compiler, old_status, new_status)
+      | _ -> None
+    ) new_statuses in
+
+    if List.length changes > 0 then
+      Some (Status_changed (package, changes))
+    else
+      None
+  ) common_packages in
+
+  (* Build new/removed package info with their statuses *)
+  let new_packages_with_status = List.map (fun package ->
+    let statuses = Array.to_list new_compilers |> List.filter_map (fun compiler ->
+      match Hashtbl.find_opt new_map { package; compiler } with
+      | Some result -> Some (compiler, result.status)
+      | None -> None
+    ) in
+    New_package (package, statuses)
+  ) new_packages_list in
+
+  let removed_packages_with_status = List.map (fun package ->
+    let statuses = Array.to_list old_compilers |> List.filter_map (fun compiler ->
+      match Hashtbl.find_opt old_map { package; compiler } with
+      | Some result -> Some (compiler, result.status)
+      | None -> None
+    ) in
+    Removed_package (package, statuses)
+  ) removed_packages_list in
+
+  (new_packages_with_status, removed_packages_with_status, changed_packages)
+
 let load_full_data filename build_map =
   let table = Arrow.Parquet_reader.table filename in
   let name_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "name") in
@@ -292,18 +365,19 @@ let status_char = function
   | "no_solution" -> "○"
   | _ -> "?"
 
-let draw_home_view { commits; selected_commit; scroll_offset } (w, h) =
+let draw_home_view { commits; selected_commit; scroll_offset; selected_commits } (w, h) =
   let list_items =
-    List.map (fun commit ->
+    List.mapi (fun idx commit ->
         let download_indicator =
           match commit.availability with
           | Downloaded -> Some "●"      (* filled circle *)
           | Available -> Some "○"       (* empty circle *)
           | Not_available -> Some "-"   (* dash *)
         in
+        let selection_indicator = if List.mem idx selected_commits then "[*]" else "[ ]" in
         let short_sha = String.sub commit.sha 0 (min 8 (String.length commit.sha)) in
         let message_truncated = if String.length commit.message > 60 then String.sub commit.message 0 60 else commit.message in
-        let display_text = Printf.sprintf "%s %s - %s" short_sha commit.date message_truncated in
+        let display_text = Printf.sprintf "%s %s %s - %s" selection_indicator short_sha commit.date message_truncated in
         Day10_tui_lib.List_widget.List.{ content = commit; display_text; status_indicator = download_indicator; attr = A.(fg white) }) commits
   in
 
@@ -323,6 +397,61 @@ let draw_home_view { commits; selected_commit; scroll_offset } (w, h) =
 let show_error_message term error_msg =
   let config = Day10_tui_lib.Dialog_widget.Dialog.{ dialog_type = Error; title = ""; message = error_msg; help_text = "Press any key to continue..." } in
   Day10_tui_lib.Dialog_widget.Dialog.show_dialog term config
+
+let draw_diff_view diff_info (w, h) =
+  let content = [
+    "=== COMMIT COMPARISON ===";
+    "";
+    Printf.sprintf "Comparing %d commits:" (List.length diff_info.selected_commits);
+  ] @ (List.map (fun commit -> Printf.sprintf "  %s - %s"
+    (String.sub commit.sha 0 8) commit.message) diff_info.selected_commits) @ [
+    "";
+    "📈 NEW PACKAGES:";
+  ] @ (List.map (function
+    | New_package (pkg, _) -> Printf.sprintf "  + %s" pkg
+    | _ -> "") diff_info.new_packages) @ [
+    "";
+    "🗑️ REMOVED PACKAGES:";
+  ] @ (List.map (function
+    | Removed_package (pkg, _) -> Printf.sprintf "  - %s" pkg
+    | _ -> "") diff_info.removed_packages) @ [
+    "";
+    "📊 STATUS CHANGES:";
+  ] @ (List.fold_left (fun acc -> function
+    | Status_changed (pkg, changes) ->
+        let pkg_line = Printf.sprintf "  ~ %s:" pkg in
+        let change_lines = List.map (fun (compiler, old_status, new_status) ->
+          Printf.sprintf "    %s: %s → %s" compiler old_status new_status
+        ) changes in
+        acc @ [pkg_line] @ change_lines
+    | _ -> acc) [] diff_info.status_changes) @ [
+    "";
+    "Press Q/Escape to return to commit list";
+  ] in
+
+  let visible_content =
+    let start_line = diff_info.diff_scroll in
+    let end_line = min (List.length content) (start_line + h - 1) in
+    if start_line < List.length content then
+      let rec take n lst = match n, lst with
+        | 0, _ -> []
+        | n, [] -> []
+        | n, x :: xs -> x :: take (n - 1) xs
+      in
+      let rec drop n lst = match n, lst with
+        | 0, lst -> lst
+        | n, [] -> []
+        | n, _ :: xs -> drop (n - 1) xs
+      in
+      content |> drop start_line |> take (end_line - start_line)
+    else
+      []
+  in
+
+  let lines = List.map (fun line -> I.string A.(fg white) line) visible_content in
+  match lines with
+  | [] -> I.string A.(fg white) "No diff data"
+  | hd :: tl -> List.fold_left I.(<->) hd tl
 
 let draw_detail_view detail (w, h) =
   let header = Printf.sprintf "Package: %s | Compiler: %s | Status: %s" detail.key.package detail.key.compiler detail.result.status in
@@ -395,6 +524,13 @@ let sanitize_text text =
       let code = Char.code c in
       if code < 32 && code <> 10 then ' ' else c) text
 
+(* Helper function to toggle selection of a commit *)
+let toggle_commit_selection selected_commits idx =
+  if List.mem idx selected_commits then
+    List.filter ((<>) idx) selected_commits
+  else
+    idx :: selected_commits
+
 let handle_home_event term state home event =
   match event with
   | `Key (`Arrow `Up, []) ->
@@ -433,27 +569,83 @@ let handle_home_event term state home event =
       let new_scroll = max 0 (max_idx - content_height + 1) in
       let new_home = { home with selected_commit = max_idx; scroll_offset = new_scroll } in
       `Continue { state with mode = Home_view new_home }
+  | `Key (`ASCII ' ', []) ->
+      (* Toggle selection on current commit and move down *)
+      let new_selected_commits = toggle_commit_selection home.selected_commits home.selected_commit in
+      let max_idx = List.length home.commits - 1 in
+      let new_selected = min max_idx (home.selected_commit + 1) in
+      let content_height = snd (NottyTerm.size term) - 3 in
+      let new_scroll = if new_selected >= home.scroll_offset + content_height then new_selected - content_height + 1 else home.scroll_offset in
+      let new_home = { home with selected_commit = new_selected; scroll_offset = new_scroll; selected_commits = new_selected_commits } in
+      `Continue { state with mode = Home_view new_home }
   | `Key (`Enter, []) -> (
-      match List.nth_opt home.commits home.selected_commit with
-      | Some commit -> (
-          let filename = commit.sha ^ ".parquet" in
-          match download_parquet commit.sha with
-          | `Success -> (
-              try
-                let build_map, packages, compilers = analyze_data filename in
-                let new_state = { state with current_filename = filename; build_map; packages; compilers; full_data_loaded = false; mode = Table_view } in
-                `Continue new_state
-              with
-              | exn ->
-                  let raw_error = Printexc.to_string exn in
-                  let clean_error = sanitize_text raw_error in
-                  let error_msg = Printf.sprintf "Failed to parse parquet file: %s" clean_error in
-                  show_error_message term error_msg;
-                  `Continue state)
-          | `Error error_msg ->
-              show_error_message term error_msg;
-              `Continue state)
-      | None -> `Continue state)
+      if List.length home.selected_commits >= 2 then (
+        (* Multi-commit diff mode *)
+        try
+          let selected_commit_objs = List.filter_map (fun idx ->
+            List.nth_opt home.commits idx
+          ) home.selected_commits in
+
+          (* Load data for all selected commits *)
+          let commit_data_list = List.filter_map (fun commit ->
+            let filename = commit.sha ^ ".parquet" in
+            match download_parquet commit.sha with
+            | `Success -> (
+                try
+                  let build_map, packages, compilers = analyze_data filename in
+                  Some (commit, build_map, packages, compilers)
+                with _ -> None
+            )
+            | `Error _ -> None
+          ) selected_commit_objs in
+
+          if List.length commit_data_list >= 2 then (
+            (* Compare first and last commits *)
+            let (_, old_map, old_packages, old_compilers) = List.hd commit_data_list in
+            let (_, new_map, new_packages, new_compilers) = List.hd (List.rev commit_data_list) in
+
+            let (new_packages_diff, removed_packages_diff, status_changes_diff) =
+              compare_build_maps old_map old_packages old_compilers new_map new_packages new_compilers in
+
+            let diff_info = {
+              selected_commits = selected_commit_objs;
+              new_packages = new_packages_diff;
+              removed_packages = removed_packages_diff;
+              status_changes = status_changes_diff;
+              diff_scroll = 0;
+            } in
+            `Continue { state with mode = Diff_view diff_info }
+          ) else (
+            show_error_message term "Could not load data for selected commits";
+            `Continue state
+          )
+        with exn ->
+          let error_msg = Printf.sprintf "Error comparing commits: %s" (Printexc.to_string exn) in
+          show_error_message term error_msg;
+          `Continue state
+      ) else (
+        (* Single commit mode - normal behavior *)
+        match List.nth_opt home.commits home.selected_commit with
+        | Some commit -> (
+            let filename = commit.sha ^ ".parquet" in
+            match download_parquet commit.sha with
+            | `Success -> (
+                try
+                  let build_map, packages, compilers = analyze_data filename in
+                  let new_state = { state with current_filename = filename; build_map; packages; compilers; full_data_loaded = false; mode = Table_view } in
+                  `Continue new_state
+                with
+                | exn ->
+                    let raw_error = Printexc.to_string exn in
+                    let clean_error = sanitize_text raw_error in
+                    let error_msg = Printf.sprintf "Failed to parse parquet file: %s" clean_error in
+                    show_error_message term error_msg;
+                    `Continue state)
+            | `Error error_msg ->
+                show_error_message term error_msg;
+                `Continue state)
+        | None -> `Continue state
+      ))
   | `Key (`ASCII 'q', [])
   | `Key (`Escape, []) ->
       `Quit
@@ -496,6 +688,23 @@ let handle_detail_event term state detail event =
   | `Key (`Escape, [])
   | `Key (`ASCII 'q', []) ->
       `Continue { state with mode = Table_view }
+  | _ -> `Continue state
+
+let handle_diff_event term state diff_info event =
+  match event with
+  | `Key (`Arrow `Up, []) ->
+      let new_scroll = max 0 (diff_info.diff_scroll - 1) in
+      let new_diff = { diff_info with diff_scroll = new_scroll } in
+      `Continue { state with mode = Diff_view new_diff }
+  | `Key (`Arrow `Down, []) ->
+      let new_scroll = diff_info.diff_scroll + 1 in
+      let new_diff = { diff_info with diff_scroll = new_scroll } in
+      `Continue { state with mode = Diff_view new_diff }
+  | `Key (`ASCII 'q', [])
+  | `Key (`Escape, []) ->
+      let commits = get_git_commits state.opam_repo_path state.num_commits in
+      let home = { commits; selected_commit = 0; scroll_offset = 0; selected_commits = [] } in
+      `Continue { state with mode = Home_view home }
   | _ -> `Continue state
 
 let handle_table_event term state event =
@@ -576,7 +785,7 @@ let handle_table_event term state event =
   | `Key (`ASCII 'q', [])
   | `Key (`Escape, []) ->
       let commits = get_git_commits state.opam_repo_path state.num_commits in
-      let home = { commits; selected_commit = 0; scroll_offset = 0 } in
+      let home = { commits; selected_commit = 0; scroll_offset = 0; selected_commits = [] } in
       `Continue { state with mode = Home_view home }
   | _ -> `Continue state
 
@@ -586,6 +795,7 @@ let rec event_loop term state =
     | Home_view home -> draw_home_view home (NottyTerm.size term)
     | Table_view -> draw_table state (NottyTerm.size term)
     | Detail_view detail -> draw_detail_view detail (NottyTerm.size term)
+    | Diff_view diff_info -> draw_diff_view diff_info (NottyTerm.size term)
   in
   NottyTerm.image term img;
   let event = NottyTerm.event term in
@@ -594,6 +804,7 @@ let rec event_loop term state =
     | Home_view home, event -> handle_home_event term state home event
     | Detail_view detail, event -> handle_detail_event term state detail event
     | Table_view, event -> handle_table_event term state event
+    | Diff_view diff_info, event -> handle_diff_event term state diff_info event
   in
   match result with
   | `Continue new_state -> event_loop term new_state
@@ -622,7 +833,7 @@ let main_cmd opam_repo_path num_commits fetch_flag =
       Printf.printf "3. The repository has commit history\n";
       exit 1);
     let term = NottyTerm.create () in
-    let home = { commits; selected_commit = 0; scroll_offset = 0 } in
+    let home = { commits; selected_commit = 0; scroll_offset = 0; selected_commits = [] } in
     let state =
       {
         opam_repo_path;
