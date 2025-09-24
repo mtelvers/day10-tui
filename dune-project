@@ -5,22 +5,22 @@
 (generate_opam_files true)
 
 (source
- (github username/reponame))
+ (github mtelvers/day10-tui))
 
-(authors "Author Name <author@example.com>")
+(authors "Mark Elvers <mark.elvers@tunbury.org")
 
-(maintainers "Maintainer Name <maintainer@example.com>")
+(maintainers "Mark Elvers <mark.elvers@tunbury.org")
 
-(license LICENSE)
+(license MIT)
 
-(documentation https://url/to/documentation)
+(documentation https://github.com/mtelvers/day10-tui)
 
 (package
  (name day10-tui)
- (synopsis "A short synopsis")
- (description "A longer description")
+ (synopsis "Terminal UI for browsing opam repository build results")
+ (description "A fast terminal-based interface for analyzing Apache Arrow parquet files containing opam repository build results. Features include commit browsing, package/compiler matrix views, detailed build logs, and multi-commit diff comparisons.")
  (depends ocaml ctypes ctypes-foreign ptime cmdliner)
  (tags
-  ("add topics" "to describe" your project)))
+  ("tui" "terminal" "opam" "build-results" "arrow" "parquet")))
 
 ; See the complete stanza docs at https://dune.readthedocs.io/en/stable/reference/dune-project/index.html
