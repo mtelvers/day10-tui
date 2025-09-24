@@ -6,11 +6,39 @@ module Term = Notty_unix.Term
 
 let column_width = 8
 
+module String = struct
+  include String
+  let strstr haystack needle =
+    let haystack_len = String.length haystack in
+    let needle_len = String.length needle in
+
+    if needle_len = 0 then Some 0
+    else if needle_len > haystack_len then None
+    else
+      let rec search pos =
+        if pos > haystack_len - needle_len then None
+        else
+          let rec match_at i =
+            if i = needle_len then true
+            else if haystack.[pos + i] = needle.[i] then match_at (i + 1)
+            else false
+          in
+          if match_at 0 then Some pos
+          else search (pos + 1)
+      in
+      search 0
+end
+
+type availability_status =
+  | Downloaded        (* filled circle - file exists locally *)
+  | Available         (* empty circle - available on server *)
+  | Not_available     (* dash - not on server *)
+
 type commit_info = {
   sha : string;
   message : string;
   date : string;
-  downloaded : bool;
+  availability : availability_status;
 }
 
 type build_key = {
@@ -57,9 +85,40 @@ type tui_state = {
   mode : app_mode;
 }
 
+(* Fetch and parse server directory listing to get available files *)
+let get_available_files () =
+  let url = "https://www.cl.cam.ac.uk/~mte24/day10/" in
+  let cmd = Stdlib.Filename.quote_command "curl" [ "-s"; "-f"; url ] ~stderr:"/dev/null" in
+  try
+    let ic = Unix.open_process_in cmd in
+    let available_files = ref [] in
+    let rec read_lines () =
+      try
+        let line = input_line ic in
+        (* Look for lines containing .parquet files in href attributes *)
+        (match String.strstr line ".parquet" with
+        | Some parquet_idx ->
+            (match String.rindex_from_opt line (parquet_idx - 1) '"' with
+            | Some quote_idx ->
+                let start_idx = quote_idx + 1 in
+                let end_idx = parquet_idx + 8 in (* ".parquet" is 8 chars *)
+                let filename = String.sub line start_idx (end_idx - start_idx) in
+                available_files := filename :: !available_files
+            | None -> () (* No quote found *))
+        | None -> ());
+        read_lines ()
+      with End_of_file -> ()
+    in
+    read_lines ();
+    let _ = Unix.close_process_in ic in
+    !available_files
+  with _ -> []
+
 let get_git_commits opam_repo_path =
   let cmd = Stdlib.Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "-n"; "50"; "--format=%H|%s|%ci" ] ~stderr:"/dev/null" in
   try
+    (* Get the list of available files from server once *)
+    let available_files = get_available_files () in
     let ic = Unix.open_process_in cmd in
     let result =
       try
@@ -69,7 +128,16 @@ let get_git_commits opam_repo_path =
             let parts = String.split_on_char '|' line in
             match parts with
             | [ sha; message; date ] ->
-                let commit = { sha; message; date; downloaded = Stdlib.Sys.file_exists (sha ^ ".parquet") } in
+                let filename = sha ^ ".parquet" in
+                let availability =
+                  if Stdlib.Sys.file_exists filename then
+                    Downloaded
+                  else if List.mem filename available_files then
+                    Available
+                  else
+                    Not_available
+                in
+                let commit = { sha; message; date; availability } in
                 read_lines (commit :: acc)
             | _ -> read_lines acc
           with
@@ -180,7 +248,12 @@ let status_char = function
 let draw_home_view { commits; selected_commit; scroll_offset } (w, h) =
   let list_items =
     List.map (fun commit ->
-        let download_indicator = if commit.downloaded then Some "✓" else Some "○" in
+        let download_indicator =
+          match commit.availability with
+          | Downloaded -> Some "●"      (* filled circle *)
+          | Available -> Some "○"       (* empty circle *)
+          | Not_available -> Some "-"   (* dash *)
+        in
         let short_sha = String.sub commit.sha 0 (min 8 (String.length commit.sha)) in
         let message_truncated = if String.length commit.message > 60 then String.sub commit.message 0 60 else commit.message in
         let display_text = Printf.sprintf "%s %s - %s" short_sha commit.date message_truncated in
