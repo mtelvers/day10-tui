@@ -500,10 +500,6 @@ let handle_detail_event term state detail event =
 
 let handle_table_event term state event =
   match event with
-  | `Key (`ASCII 'h', []) ->
-      let commits = get_git_commits state.opam_repo_path state.num_commits in
-      let home = { commits; selected_commit = 0; scroll_offset = 0 } in
-      `Continue { state with mode = Home_view home }
   | `Key (`Arrow `Up, []) ->
       let new_y = max 0 (state.selected_y - 1) in
       let new_scroll_y = if new_y < state.scroll_y then new_y else state.scroll_y in
@@ -579,7 +575,9 @@ let handle_table_event term state event =
       | None -> `Continue state))
   | `Key (`ASCII 'q', [])
   | `Key (`Escape, []) ->
-      `Quit
+      let commits = get_git_commits state.opam_repo_path state.num_commits in
+      let home = { commits; selected_commit = 0; scroll_offset = 0 } in
+      `Continue { state with mode = Home_view home }
   | _ -> `Continue state
 
 let rec event_loop term state =
