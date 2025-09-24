@@ -1,3 +1,6 @@
 [submodule "notty"]
 	path = notty
 	url = https://github.com/pqwy/notty
+[submodule "arrow"]
+	path = arrow
+	url = https://github.com/mtelvers/arrow

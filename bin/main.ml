@@ -398,7 +398,7 @@ let show_error_message term error_msg =
   let config = Day10_tui_lib.Dialog_widget.Dialog.{ dialog_type = Error; title = ""; message = error_msg; help_text = "Press any key to continue..." } in
   Day10_tui_lib.Dialog_widget.Dialog.show_dialog term config
 
-let draw_diff_view diff_info (w, h) =
+let draw_diff_view diff_info (_w, h) =
   let content = [
     "=== COMMIT COMPARISON ===";
     "";
@@ -435,12 +435,12 @@ let draw_diff_view diff_info (w, h) =
     if start_line < List.length content then
       let rec take n lst = match n, lst with
         | 0, _ -> []
-        | n, [] -> []
+        | _n, [] -> []
         | n, x :: xs -> x :: take (n - 1) xs
       in
       let rec drop n lst = match n, lst with
         | 0, lst -> lst
-        | n, [] -> []
+        | _n, [] -> []
         | n, _ :: xs -> drop (n - 1) xs
       in
       content |> drop start_line |> take (end_line - start_line)
@@ -690,7 +690,7 @@ let handle_detail_event term state detail event =
       `Continue { state with mode = Table_view }
   | _ -> `Continue state
 
-let handle_diff_event term state diff_info event =
+let handle_diff_event _term state diff_info event =
   match event with
   | `Key (`Arrow `Up, []) ->
       let new_scroll = max 0 (diff_info.diff_scroll - 1) in
