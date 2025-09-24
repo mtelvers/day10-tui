@@ -162,7 +162,7 @@ let fetch_repository opam_repo_path =
     Printf.printf "Warning: Failed to fetch from %s\n" remote
 
 let get_git_commits opam_repo_path num_commits =
-  let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci" ] ~stderr:"/dev/null" in
+  let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "--merges"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci" ] ~stderr:"/dev/null" in
   try
     (* Get the list of available files from server once *)
     let available_files = get_available_files () in
