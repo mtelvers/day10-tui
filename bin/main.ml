@@ -505,7 +505,7 @@ let filter_packages packages compilers build_map selected_compiler filter_type =
     | No_filter -> true
     | Filter_failed ->
         (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
-        | Some result -> result.status = "failed"
+        | Some result -> result.status = "failure"
         | None -> false)
     | Filter_no_solution ->
         (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
@@ -545,7 +545,14 @@ let draw_table state (w, h) =
     | Filter_success -> " [SUCCESS]"
   in
 
-  let help_text = Printf.sprintf "Arrows: navigate | Enter: details | Q: back | f/n/d/s: filter%s" filter_status_text in
+  let total_packages = Array.length state.packages in
+  let filtered_count = Array.length filtered_packages in
+  let count_text = if filtered_count = total_packages then
+    Printf.sprintf " (%d packages)" total_packages
+  else
+    Printf.sprintf " (%d/%d packages)" filtered_count total_packages
+  in
+  let help_text = Printf.sprintf "Arrows: navigate | Enter: details | Q: back | f/n/d/s: filter%s%s" filter_status_text count_text in
 
   let config =
     {
