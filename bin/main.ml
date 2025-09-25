@@ -88,6 +88,13 @@ type app_mode =
   | Detail_view of detail_info
   | Diff_view of diff_info
 
+type table_filter =
+  | No_filter
+  | Filter_failed
+  | Filter_no_solution
+  | Filter_dependency_failed
+  | Filter_success
+
 type tui_state = {
   opam_repo_path : string;
   num_commits : int; (* Number of commits to show *)
@@ -100,6 +107,7 @@ type tui_state = {
   scroll_y : int; (* vertical scroll for packages *)
   selected_x : int; (* selected compiler column *)
   selected_y : int; (* selected package row *)
+  table_filter : table_filter; (* Current filter for table view *)
   mode : app_mode;
 }
 
@@ -489,7 +497,34 @@ let draw_detail_view detail (w, h) =
 
   Day10_tui_lib.Text_viewer_widget.TextViewer.draw_viewer config (w, h)
 
+(* Filter packages based on current filter and selected compiler *)
+let filter_packages packages compilers build_map selected_compiler filter_type =
+  let selected_compiler_name = compilers.(selected_compiler) in
+  Array.to_list packages |> List.filter (fun package ->
+    match filter_type with
+    | No_filter -> true
+    | Filter_failed ->
+        (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
+        | Some result -> result.status = "failed"
+        | None -> false)
+    | Filter_no_solution ->
+        (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
+        | Some result -> result.status = "no_solution"
+        | None -> false)
+    | Filter_dependency_failed ->
+        (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
+        | Some result -> result.status = "dependency_failed"
+        | None -> false)
+    | Filter_success ->
+        (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
+        | Some result -> result.status = "success"
+        | None -> false)
+  ) |> Array.of_list
+
 let draw_table state (w, h) =
+  (* Filter packages based on current filter and selected compiler *)
+  let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+
   let get_cell ~row ~column =
     if String.equal column "_row_name" then { Table_widget.Table.text = row; attr = A.(fg white) }
     else
@@ -502,9 +537,19 @@ let draw_table state (w, h) =
       | None -> { Table_widget.Table.text = "-"; attr = A.(fg white) }
   in
 
+  let filter_status_text = match state.table_filter with
+    | No_filter -> ""
+    | Filter_failed -> " [FAILED]"
+    | Filter_no_solution -> " [NO_SOLUTION]"
+    | Filter_dependency_failed -> " [DEP_FAILED]"
+    | Filter_success -> " [SUCCESS]"
+  in
+
+  let help_text = Printf.sprintf "Arrows: navigate | Enter: details | Q: back | f/n/d/s: filter%s" filter_status_text in
+
   let config =
     {
-      Table_widget.Table.rows = state.packages;
+      Table_widget.Table.rows = filtered_packages;
       columns = state.compilers;
       get_cell;
       row_height = 1;
@@ -513,7 +558,7 @@ let draw_table state (w, h) =
       selected_col = Some state.selected_x;
       scroll_row = state.scroll_y;
       scroll_col = state.scroll_x;
-      help_text = "Arrows: move, PgUp/PgDn: page, Home/End: first/last row, Enter: details, h: home, q: quit";
+      help_text;
     }
   in
 
@@ -632,7 +677,7 @@ let handle_home_event term state home event =
             | `Success -> (
                 try
                   let build_map, packages, compilers = analyze_data filename in
-                  let new_state = { state with current_filename = filename; build_map; packages; compilers; full_data_loaded = false; mode = Table_view } in
+                  let new_state = { state with current_filename = filename; build_map; packages; compilers; full_data_loaded = false; table_filter = No_filter; mode = Table_view } in
                   `Continue new_state
                 with
                 | exn ->
@@ -714,7 +759,8 @@ let handle_table_event term state event =
       let new_scroll_y = if new_y < state.scroll_y then new_y else state.scroll_y in
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Arrow `Down, []) ->
-      let max_y = Array.length state.packages - 1 in
+      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+      let max_y = Array.length filtered_packages - 1 in
       let new_y = min max_y (state.selected_y + 1) in
       let term_height = snd (NottyTerm.size term) - 4 in
       let new_scroll_y = if new_y >= state.scroll_y + term_height then new_y - term_height + 1 else state.scroll_y in
@@ -737,7 +783,8 @@ let handle_table_event term state event =
       let new_scroll_y = max 0 (min new_y state.scroll_y) in
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Page `Down, []) ->
-      let max_y = Array.length state.packages - 1 in
+      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+      let max_y = Array.length filtered_packages - 1 in
       let term_height = snd (NottyTerm.size term) - 4 in
       let page_size = max 1 (term_height - 1) in
       let new_y = min max_y (state.selected_y + page_size) in
@@ -745,12 +792,17 @@ let handle_table_event term state event =
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Home, []) -> `Continue { state with selected_y = 0; scroll_y = 0 }
   | `Key (`End, []) ->
-      let max_y = Array.length state.packages - 1 in
+      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+      let max_y = Array.length filtered_packages - 1 in
       let term_height = snd (NottyTerm.size term) - 4 in
       let new_scroll_y = max 0 (max_y - term_height + 1) in
       `Continue { state with selected_y = max_y; scroll_y = new_scroll_y }
   | `Key (`Enter, []) -> (
-      let package = state.packages.(state.selected_y) in
+      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+      if Array.length filtered_packages = 0 then
+        `Continue state
+      else
+      let package = filtered_packages.(state.selected_y) in
       let compiler = state.compilers.(state.selected_x) in
       let key = { package; compiler } in
       (match Hashtbl.find_opt state.build_map key with
@@ -782,6 +834,16 @@ let handle_table_event term state event =
           let detail = { key; result = final_result; log_lines; solution_lines; detail_scroll = 0 } in
           `Continue { updated_state with mode = Detail_view detail }
       | None -> `Continue state))
+  | `Key (`ASCII 'f', []) ->
+      `Continue { state with table_filter = Filter_failed; selected_y = 0; scroll_y = 0 }
+  | `Key (`ASCII 'n', []) ->
+      `Continue { state with table_filter = Filter_no_solution; selected_y = 0; scroll_y = 0 }
+  | `Key (`ASCII 'd', []) ->
+      `Continue { state with table_filter = Filter_dependency_failed; selected_y = 0; scroll_y = 0 }
+  | `Key (`ASCII 's', []) ->
+      `Continue { state with table_filter = Filter_success; selected_y = 0; scroll_y = 0 }
+  | `Key (`ASCII 'c', []) ->
+      `Continue { state with table_filter = No_filter; selected_y = 0; scroll_y = 0 }
   | `Key (`ASCII 'q', [])
   | `Key (`Escape, []) ->
       let commits = get_git_commits state.opam_repo_path state.num_commits in
@@ -847,6 +909,7 @@ let main_cmd opam_repo_path num_commits fetch_flag =
         scroll_y = 0;
         selected_x = 0;
         selected_y = 0;
+        table_filter = No_filter;
         mode = Home_view home;
       }
     in
