@@ -108,6 +108,8 @@ type tui_state = {
   selected_x : int; (* selected compiler column *)
   selected_y : int; (* selected package row *)
   table_filter : table_filter; (* Current filter for table view *)
+  search_mode : bool; (* Whether we're in search input mode *)
+  search_text : string; (* Current search text *)
   mode : app_mode;
 }
 
@@ -498,9 +500,19 @@ let draw_detail_view detail (w, h) =
   Day10_tui_lib.Text_viewer_widget.TextViewer.draw_viewer config (w, h)
 
 (* Filter packages based on current filter and selected compiler *)
-let filter_packages packages compilers build_map selected_compiler filter_type =
+let filter_packages packages compilers build_map selected_compiler filter_type search_text =
   let selected_compiler_name = compilers.(selected_compiler) in
+  let matches_search package =
+    if String.length search_text = 0 then true
+    else
+      let package_lower = String.lowercase_ascii package in
+      let search_lower = String.lowercase_ascii search_text in
+      match String.strstr package_lower search_lower with
+      | Some _ -> true
+      | None -> false
+  in
   Array.to_list packages |> List.filter (fun package ->
+    matches_search package &&
     match filter_type with
     | No_filter -> true
     | Filter_failed ->
@@ -523,7 +535,7 @@ let filter_packages packages compilers build_map selected_compiler filter_type =
 
 let draw_table state (w, h) =
   (* Filter packages based on current filter and selected compiler *)
-  let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+  let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter state.search_text in
 
   let get_cell ~row ~column =
     if String.equal column "_row_name" then { Table_widget.Table.text = row; attr = A.(fg white) }
@@ -552,7 +564,13 @@ let draw_table state (w, h) =
   else
     Printf.sprintf " (%d/%d packages)" filtered_count total_packages
   in
-  let help_text = Printf.sprintf "Arrows: navigate | Enter: details | Q: back | f/n/d/s: filter%s%s" filter_status_text count_text in
+  let search_text = if String.length state.search_text > 0 then
+    Printf.sprintf " search: \"%s\"" state.search_text
+  else
+    ""
+  in
+  let search_mode_text = if state.search_mode then " [SEARCHING]" else "" in
+  let help_text = Printf.sprintf "Arrows: navigate | Enter: details | Q: back | /: search | f/n/d/s: filter%s%s%s%s" filter_status_text count_text search_text search_mode_text in
 
   let config =
     {
@@ -684,7 +702,7 @@ let handle_home_event term state home event =
             | `Success -> (
                 try
                   let build_map, packages, compilers = analyze_data filename in
-                  let new_state = { state with current_filename = filename; build_map; packages; compilers; full_data_loaded = false; table_filter = No_filter; mode = Table_view } in
+                  let new_state = { state with current_filename = filename; build_map; packages; compilers; full_data_loaded = false; table_filter = No_filter; search_mode = false; search_text = ""; mode = Table_view } in
                   `Continue new_state
                 with
                 | exn ->
@@ -760,13 +778,31 @@ let handle_diff_event _term state diff_info event =
   | _ -> `Continue state
 
 let handle_table_event term state event =
-  match event with
+  if state.search_mode then
+    match event with
+    | `Key (`Escape, []) ->
+        `Continue { state with search_mode = false; search_text = ""; selected_y = 0; scroll_y = 0 }
+    | `Key (`Enter, []) ->
+        `Continue { state with search_mode = false; selected_y = 0; scroll_y = 0 }
+    | `Key (`Backspace, []) ->
+        let new_text = if String.length state.search_text > 0 then
+          String.sub state.search_text 0 (String.length state.search_text - 1)
+        else
+          state.search_text
+        in
+        `Continue { state with search_text = new_text; selected_y = 0; scroll_y = 0 }
+    | `Key (`ASCII c, []) when c >= ' ' && c <= '~' ->
+        let new_text = state.search_text ^ (String.make 1 c) in
+        `Continue { state with search_text = new_text; selected_y = 0; scroll_y = 0 }
+    | _ -> `Continue state
+  else
+    match event with
   | `Key (`Arrow `Up, []) ->
       let new_y = max 0 (state.selected_y - 1) in
       let new_scroll_y = if new_y < state.scroll_y then new_y else state.scroll_y in
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Arrow `Down, []) ->
-      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter state.search_text in
       let max_y = Array.length filtered_packages - 1 in
       let new_y = min max_y (state.selected_y + 1) in
       let term_height = snd (NottyTerm.size term) - 4 in
@@ -790,7 +826,7 @@ let handle_table_event term state event =
       let new_scroll_y = max 0 (min new_y state.scroll_y) in
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Page `Down, []) ->
-      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter state.search_text in
       let max_y = Array.length filtered_packages - 1 in
       let term_height = snd (NottyTerm.size term) - 4 in
       let page_size = max 1 (term_height - 1) in
@@ -799,13 +835,13 @@ let handle_table_event term state event =
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
   | `Key (`Home, []) -> `Continue { state with selected_y = 0; scroll_y = 0 }
   | `Key (`End, []) ->
-      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter state.search_text in
       let max_y = Array.length filtered_packages - 1 in
       let term_height = snd (NottyTerm.size term) - 4 in
       let new_scroll_y = max 0 (max_y - term_height + 1) in
       `Continue { state with selected_y = max_y; scroll_y = new_scroll_y }
   | `Key (`Enter, []) -> (
-      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter in
+      let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter state.search_text in
       if Array.length filtered_packages = 0 then
         `Continue state
       else
@@ -849,8 +885,10 @@ let handle_table_event term state event =
       `Continue { state with table_filter = Filter_dependency_failed; selected_y = 0; scroll_y = 0 }
   | `Key (`ASCII 's', []) ->
       `Continue { state with table_filter = Filter_success; selected_y = 0; scroll_y = 0 }
+  | `Key (`ASCII '/', []) ->
+      `Continue { state with search_mode = true }
   | `Key (`ASCII 'c', []) ->
-      `Continue { state with table_filter = No_filter; selected_y = 0; scroll_y = 0 }
+      `Continue { state with table_filter = No_filter; search_text = ""; selected_y = 0; scroll_y = 0 }
   | `Key (`ASCII 'q', [])
   | `Key (`Escape, []) ->
       let commits = get_git_commits state.opam_repo_path state.num_commits in
@@ -917,6 +955,8 @@ let main_cmd opam_repo_path num_commits fetch_flag =
         selected_x = 0;
         selected_y = 0;
         table_filter = No_filter;
+        search_mode = false;
+        search_text = "";
         mode = Home_view home;
       }
     in
