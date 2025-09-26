@@ -1,10 +1,13 @@
 open Notty
 open Day10_tui_lib
 
-(* open Notty.Infix *)
 module NottyTerm = Notty_unix.Term
 
+(* UI Layout Constants *)
 let column_width = 8
+let short_sha_length = 8
+let message_truncate_length = 60
+let default_hashtable_size = 5000
 
 module StringSet = Set.Make(String)
 
@@ -122,56 +125,69 @@ type tui_state = {
   mode : app_mode;
 }
 
+(* Extract remote name from a git remote line *)
+let extract_remote_name line =
+  match String.split_on_char '\t' line with
+  | remote_name :: _ -> Some remote_name
+  | [] ->
+      match String.split_on_char ' ' line with
+      | remote_name :: _ -> Some remote_name
+      | [] -> None
+
+(* Check if a line contains an official opam repository URL *)
+let is_official_opam_repo line =
+  String.strstr line "https://github.com/ocaml/opam-repository" <> None ||
+  String.strstr line "https://github.com/oxcaml/opam-repository" <> None
+
+(* Find the official remote name from git remote output *)
+let find_official_remote opam_repo_path =
+  let remote_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "remote"; "-v" ] in
+  try
+    let ic = Unix.open_process_in remote_cmd in
+    let rec search_remotes () =
+      try
+        let line = input_line ic in
+        if is_official_opam_repo line then
+          extract_remote_name line
+        else
+          search_remotes ()
+      with End_of_file -> None
+    in
+    let result = search_remotes () in
+    let _ = Unix.close_process_in ic in
+    match result with
+    | Some remote -> remote
+    | None -> "origin" (* fallback *)
+  with _ -> "origin"
+
+(* Parse branch name from git ls-remote output *)
+let parse_default_branch line =
+  if String.strstr line "ref: refs/heads/" <> None then
+    let parts = String.split_on_char '/' line in
+    match List.rev parts with
+    | head_part :: _ ->
+        let branch_part = String.split_on_char '\t' head_part in
+        (match branch_part with
+        | branch :: _ -> branch
+        | [] -> "master")
+    | [] -> "master"
+  else
+    "master"
+
+(* Determine the default branch for a remote *)
+let find_default_branch opam_repo_path remote =
+  let branch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "ls-remote"; "--symref"; remote; "HEAD" ] ~stderr:"/dev/null" in
+  try
+    let ic = Unix.open_process_in branch_cmd in
+    let line = input_line ic in
+    let _ = Unix.close_process_in ic in
+    parse_default_branch line
+  with _ -> "master" (* fallback *)
+
 (* Find the remote and default branch for ocaml/oxcaml opam-repository *)
 let find_repository_remote_and_branch opam_repo_path =
-  let remote_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "remote"; "-v" ] in
-  let remote =
-    try
-      let ic = Unix.open_process_in remote_cmd in
-      let rec find_official_remote () =
-        try
-          let line = input_line ic in
-          if String.strstr line "https://github.com/ocaml/opam-repository" <> None ||
-             String.strstr line "https://github.com/oxcaml/opam-repository" <> None then (
-            (* Extract remote name (first word before whitespace) *)
-            match String.split_on_char '\t' line with
-            | remote_name :: _ -> Some remote_name
-            | [] ->
-                match String.split_on_char ' ' line with
-                | remote_name :: _ -> Some remote_name
-                | [] -> None
-          ) else
-            find_official_remote ()
-        with End_of_file -> None
-      in
-      let result = find_official_remote () in
-      let _ = Unix.close_process_in ic in
-      match result with
-      | Some r -> r
-      | None -> "origin" (* fallback *)
-    with _ -> "origin"
-  in
-  (* Determine default branch (master or main) *)
-  let branch =
-    let branch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "ls-remote"; "--symref"; remote; "HEAD" ] ~stderr:"/dev/null" in
-    try
-      let ic = Unix.open_process_in branch_cmd in
-      let line = input_line ic in
-      let _ = Unix.close_process_in ic in
-      (* Parse "ref: refs/heads/main	HEAD" to extract "main" *)
-      if String.strstr line "ref: refs/heads/" <> None then
-        let parts = String.split_on_char '/' line in
-        match List.rev parts with
-        | head_part :: _ ->
-            let branch_part = String.split_on_char '\t' head_part in
-            (match branch_part with
-            | branch :: _ -> branch
-            | [] -> "master")
-        | [] -> "master"
-      else
-        "master"
-    with _ -> "master" (* fallback *)
-  in
+  let remote = find_official_remote opam_repo_path in
+  let branch = find_default_branch opam_repo_path remote in
   (remote, branch)
 
 (* Determine data URL based on repository remote *)
@@ -203,27 +219,27 @@ let get_available_files opam_repo_path =
   let cmd = Filename.quote_command "curl" [ "-s"; "-f"; url ] ~stderr:"/dev/null" in
   try
     let ic = Unix.open_process_in cmd in
-    let available_files = ref [] in
-    let rec read_lines () =
+    let rec read_lines acc =
       try
         let line = input_line ic in
         (* Look for lines containing .parquet files in href attributes *)
-        (match String.strstr line ".parquet" with
+        let new_acc = match String.strstr line ".parquet" with
         | Some parquet_idx ->
             (match String.rindex_from_opt line (parquet_idx - 1) '"' with
             | Some quote_idx ->
                 let start_idx = quote_idx + 1 in
                 let end_idx = parquet_idx + 8 in (* ".parquet" is 8 chars *)
                 let filename = String.sub line start_idx (end_idx - start_idx) in
-                available_files := filename :: !available_files
-            | None -> () (* No quote found *))
-        | None -> ());
-        read_lines ()
-      with End_of_file -> ()
+                filename :: acc
+            | None -> acc (* No quote found *))
+        | None -> acc
+        in
+        read_lines new_acc
+      with End_of_file -> acc
     in
-    read_lines ();
+    let available_files = read_lines [] in
     let _ = Unix.close_process_in ic in
-    !available_files
+    available_files
   with _ -> []
 
 let fetch_repository opam_repo_path =
@@ -245,39 +261,43 @@ let fetch_repository opam_repo_path =
   ) else
     Printf.printf "Warning: Failed to fetch from %s\n" remote
 
-let get_git_commits opam_repo_path num_commits =
-  (* Always show commits from the tip of the remote branch *)
-  let (remote, branch) = find_repository_remote_and_branch opam_repo_path in
-  let branch_ref = remote ^ "/" ^ branch in
+(* Parse a single git log line into commit info *)
+let parse_git_log_line available_files line =
+  let parts = String.split_on_char '|' line in
+  match parts with
+  | [ sha; message; date ] ->
+      let filename = sha ^ ".parquet" in
+      let availability =
+        if Sys.file_exists filename then
+          Downloaded
+        else if List.mem filename available_files then
+          Available
+        else
+          Not_available
+      in
+      Some { sha; message; date; availability }
+  | _ -> None
+
+(* Read git log output and parse into commit list *)
+let read_git_log_lines ic available_files =
+  let rec read_lines acc =
+    try
+      let line = input_line ic in
+      match parse_git_log_line available_files line with
+      | Some commit -> read_lines (commit :: acc)
+      | None -> read_lines acc
+    with End_of_file -> acc
+  in
+  read_lines []
+
+(* Execute git log command and parse results *)
+let execute_git_log opam_repo_path branch_ref num_commits available_files =
   let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "--merges"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci"; branch_ref ] ~stderr:"/dev/null" in
   try
-    (* Get the list of available files from server once *)
-    let available_files = get_available_files opam_repo_path in
     let ic = Unix.open_process_in cmd in
     let result =
       try
-        let rec read_lines acc =
-          try
-            let line = input_line ic in
-            let parts = String.split_on_char '|' line in
-            match parts with
-            | [ sha; message; date ] ->
-                let filename = sha ^ ".parquet" in
-                let availability =
-                  if Sys.file_exists filename then
-                    Downloaded
-                  else if List.mem filename available_files then
-                    Available
-                  else
-                    Not_available
-                in
-                let commit = { sha; message; date; availability } in
-                read_lines (commit :: acc)
-            | _ -> read_lines acc
-          with
-          | End_of_file -> acc
-        in
-        let commits = read_lines [] in
+        let commits = read_git_log_lines ic available_files in
         let exit_status = Unix.close_process_in ic in
         match exit_status with
         | Unix.WEXITED 0 -> `Success (List.rev commits)
@@ -287,17 +307,23 @@ let get_git_commits opam_repo_path num_commits =
           let _ = Unix.close_process_in ic in
           raise exn
     in
-    match result with
-    | `Success commits -> commits
-    | `Error msg ->
-        Printf.printf "Warning: %s\n" msg;
-        []
+    result
   with
   | Unix.Unix_error (error, _, _) ->
-      Printf.printf "Error accessing git repository: %s\n" (Unix.error_message error);
-      []
+      `Error (Printf.sprintf "Error accessing git repository: %s" (Unix.error_message error))
   | exn ->
-      Printf.printf "Unexpected error getting git commits: %s\n" (Printexc.to_string exn);
+      `Error (Printf.sprintf "Unexpected error getting git commits: %s" (Printexc.to_string exn))
+
+let get_git_commits opam_repo_path num_commits =
+  (* Always show commits from the tip of the remote branch *)
+  let (remote, branch) = find_repository_remote_and_branch opam_repo_path in
+  let branch_ref = remote ^ "/" ^ branch in
+  (* Get the list of available files from server once *)
+  let available_files = get_available_files opam_repo_path in
+  match execute_git_log opam_repo_path branch_ref num_commits available_files with
+  | `Success commits -> commits
+  | `Error msg ->
+      Printf.printf "Warning: %s\n" msg;
       []
 
 let download_parquet opam_repo_path sha =
@@ -358,7 +384,7 @@ let analyze_data filename =
   let unique_compilers = Array.of_list (List.sort_uniq String.compare (Array.to_list compiler_col)) in
 
   (* Create a lookup map: (package, compiler) -> status only (no log/solution yet) *)
-  let build_map = Hashtbl.create 1000 in
+  let build_map = Hashtbl.create default_hashtable_size in
   Array.iteri (fun i package ->
       let compiler = compiler_col.(i) in
       match status_col.(i) with
@@ -474,8 +500,8 @@ let draw_home_view { commits; selected_commit; scroll_offset; selected_commits }
           | Not_available -> Some "-"   (* dash *)
         in
         let selection_indicator = if List.mem idx selected_commits then "[*]" else "[ ]" in
-        let short_sha = String.sub commit.sha 0 (min 8 (String.length commit.sha)) in
-        let message_truncated = if String.length commit.message > 60 then String.sub commit.message 0 60 else commit.message in
+        let short_sha = String.sub commit.sha 0 (min short_sha_length (String.length commit.sha)) in
+        let message_truncated = if String.length commit.message > message_truncate_length then String.sub commit.message 0 message_truncate_length else commit.message in
         let display_text = Printf.sprintf "%s %s %s - %s" selection_indicator short_sha commit.date message_truncated in
         Day10_tui_lib.List_widget.List.{ content = commit; display_text; status_indicator = download_indicator; attr = A.(fg white) }) commits
   in
@@ -503,7 +529,7 @@ let draw_diff_view diff_info (_w, h) =
     "";
     Printf.sprintf "Comparing %d commits:" (List.length diff_info.selected_commits);
   ] @ (List.map (fun commit -> Printf.sprintf "  %s - %s"
-    (String.sub commit.sha 0 8) commit.message) diff_info.selected_commits) @ [
+    (String.sub commit.sha 0 short_sha_length) commit.message) diff_info.selected_commits) @ [
     "";
     "📈 NEW PACKAGES:";
   ] @ (List.map (function
@@ -588,38 +614,36 @@ let draw_detail_view detail (w, h) =
 
   Day10_tui_lib.Text_viewer_widget.TextViewer.draw_viewer config (w, h)
 
+(* Check if a package/compiler combination matches a specific status *)
+let package_has_status build_map package compiler target_status =
+  match Hashtbl.find_opt build_map { package; compiler } with
+  | Some result -> result.status = target_status
+  | None -> false
+
+(* Check if a package matches the current filter *)
+let matches_filter build_map package compiler = function
+  | No_filter -> true
+  | Filter_failed -> package_has_status build_map package compiler "failure"
+  | Filter_no_solution -> package_has_status build_map package compiler "no_solution"
+  | Filter_dependency_failed -> package_has_status build_map package compiler "dependency_failed"
+  | Filter_success -> package_has_status build_map package compiler "success"
+
+(* Check if a package matches the search text *)
+let matches_search package search_text =
+  if String.length search_text = 0 then true
+  else
+    let package_lower = String.lowercase_ascii package in
+    let search_lower = String.lowercase_ascii search_text in
+    match String.strstr package_lower search_lower with
+    | Some _ -> true
+    | None -> false
+
 (* Filter packages based on current filter and selected compiler *)
 let filter_packages packages compilers build_map selected_compiler filter_type search_text =
   let selected_compiler_name = compilers.(selected_compiler) in
-  let matches_search package =
-    if String.length search_text = 0 then true
-    else
-      let package_lower = String.lowercase_ascii package in
-      let search_lower = String.lowercase_ascii search_text in
-      match String.strstr package_lower search_lower with
-      | Some _ -> true
-      | None -> false
-  in
   Array.to_list packages |> List.filter (fun package ->
-    matches_search package &&
-    match filter_type with
-    | No_filter -> true
-    | Filter_failed ->
-        (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
-        | Some result -> result.status = "failure"
-        | None -> false)
-    | Filter_no_solution ->
-        (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
-        | Some result -> result.status = "no_solution"
-        | None -> false)
-    | Filter_dependency_failed ->
-        (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
-        | Some result -> result.status = "dependency_failed"
-        | None -> false)
-    | Filter_success ->
-        (match Hashtbl.find_opt build_map { package; compiler = selected_compiler_name } with
-        | Some result -> result.status = "success"
-        | None -> false)
+    matches_search package search_text &&
+    matches_filter build_map package selected_compiler_name filter_type
   ) |> Array.of_list
 
 let draw_table state (w, h) =
@@ -1042,7 +1066,7 @@ let main_cmd opam_repo_path num_commits fetch_flag =
         opam_repo_path;
         num_commits;
         current_filename = "";  (* Will be set when a commit is selected *)
-        build_map = Hashtbl.create 1000;
+        build_map = Hashtbl.create default_hashtable_size;
         full_data_loaded = false;
         packages = [||];
         compilers = [||];
