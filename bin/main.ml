@@ -100,7 +100,6 @@ type table_filter =
 
 type column_indices = {
   name_idx : int;
-  status_idx : int;
   compiler_idx : int;
   log_idx : int;
   solution_idx : int;
@@ -371,7 +370,7 @@ let analyze_data filename =
   let solution_idx = find_column_index "solution" in
 
   (* Create column indices record *)
-  let column_indices = { name_idx; status_idx; compiler_idx; log_idx; solution_idx } in
+  let column_indices = { name_idx; compiler_idx; log_idx; solution_idx } in
 
   (* Load only the columns we need for table view *)
   let table = Arrow.Parquet_reader.table filename ~column_idxs:[name_idx; status_idx; compiler_idx] in
