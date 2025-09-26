@@ -95,6 +95,14 @@ type table_filter =
   | Filter_dependency_failed
   | Filter_success
 
+type column_indices = {
+  name_idx : int;
+  status_idx : int;
+  compiler_idx : int;
+  log_idx : int;
+  solution_idx : int;
+}
+
 type tui_state = {
   opam_repo_path : string;
   num_commits : int; (* Number of commits to show *)
@@ -103,6 +111,7 @@ type tui_state = {
   full_data_loaded : bool; (* Whether the full log/solution data has been loaded *)
   packages : string array;
   compilers : string array;
+  column_indices : column_indices option; (* Cached column indices to avoid re-reading schema *)
   scroll_x : int; (* horizontal scroll for compilers *)
   scroll_y : int; (* vertical scroll for packages *)
   selected_x : int; (* selected compiler column *)
@@ -113,9 +122,84 @@ type tui_state = {
   mode : app_mode;
 }
 
+(* Find the remote and default branch for ocaml/oxcaml opam-repository *)
+let find_repository_remote_and_branch opam_repo_path =
+  let remote_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "remote"; "-v" ] in
+  let remote =
+    try
+      let ic = Unix.open_process_in remote_cmd in
+      let rec find_official_remote () =
+        try
+          let line = input_line ic in
+          if String.strstr line "https://github.com/ocaml/opam-repository" <> None ||
+             String.strstr line "https://github.com/oxcaml/opam-repository" <> None then (
+            (* Extract remote name (first word before whitespace) *)
+            match String.split_on_char '\t' line with
+            | remote_name :: _ -> Some remote_name
+            | [] ->
+                match String.split_on_char ' ' line with
+                | remote_name :: _ -> Some remote_name
+                | [] -> None
+          ) else
+            find_official_remote ()
+        with End_of_file -> None
+      in
+      let result = find_official_remote () in
+      let _ = Unix.close_process_in ic in
+      match result with
+      | Some r -> r
+      | None -> "origin" (* fallback *)
+    with _ -> "origin"
+  in
+  (* Determine default branch (master or main) *)
+  let branch =
+    let branch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "ls-remote"; "--symref"; remote; "HEAD" ] ~stderr:"/dev/null" in
+    try
+      let ic = Unix.open_process_in branch_cmd in
+      let line = input_line ic in
+      let _ = Unix.close_process_in ic in
+      (* Parse "ref: refs/heads/main	HEAD" to extract "main" *)
+      if String.strstr line "ref: refs/heads/" <> None then
+        let parts = String.split_on_char '/' line in
+        match List.rev parts with
+        | head_part :: _ ->
+            let branch_part = String.split_on_char '\t' head_part in
+            (match branch_part with
+            | branch :: _ -> branch
+            | [] -> "master")
+        | [] -> "master"
+      else
+        "master"
+    with _ -> "master" (* fallback *)
+  in
+  (remote, branch)
+
+(* Determine data URL based on repository remote *)
+let get_data_url opam_repo_path =
+  let remote_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "remote"; "-v" ] in
+  try
+    let ic = Unix.open_process_in remote_cmd in
+    let rec find_repo_type () =
+      try
+        let line = input_line ic in
+        if String.strstr line "https://github.com/ocaml/opam-repository" <> None then
+          Some "https://www.cl.cam.ac.uk/~mte24/day10/"
+        else if String.strstr line "https://github.com/oxcaml/opam-repository" <> None then
+          Some "https://www.cl.cam.ac.uk/~mte24/day10-ox/"
+        else
+          find_repo_type ()
+      with End_of_file -> None
+    in
+    let result = find_repo_type () in
+    let _ = Unix.close_process_in ic in
+    result
+  with _ -> None
+
 (* Fetch and parse server directory listing to get available files *)
-let get_available_files () =
-  let url = "https://www.cl.cam.ac.uk/~mte24/day10/" in
+let get_available_files opam_repo_path =
+  match get_data_url opam_repo_path with
+  | None -> []
+  | Some url ->
   let cmd = Filename.quote_command "curl" [ "-s"; "-f"; url ] ~stderr:"/dev/null" in
   try
     let ic = Unix.open_process_in cmd in
@@ -144,55 +228,31 @@ let get_available_files () =
 
 let fetch_repository opam_repo_path =
   Printf.printf "Fetching latest changes from remote repository...\n";
-
-  (* Find the remote that points to https://github.com/ocaml/opam-repository *)
-  let remote_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "remote"; "-v" ] in
-  let remote =
-    try
-      let ic = Unix.open_process_in remote_cmd in
-      let rec find_official_remote () =
-        try
-          let line = input_line ic in
-          if String.strstr line "https://github.com/ocaml/opam-repository" <> None then (
-            (* Extract remote name (first word before whitespace) *)
-            match String.split_on_char '\t' line with
-            | remote_name :: _ -> Some remote_name
-            | [] ->
-                match String.split_on_char ' ' line with
-                | remote_name :: _ -> Some remote_name
-                | [] -> None
-          ) else
-            find_official_remote ()
-        with End_of_file -> None
-      in
-      let result = find_official_remote () in
-      let _ = Unix.close_process_in ic in
-      match result with
-      | Some r -> r
-      | None -> "origin" (* fallback *)
-    with _ -> "origin"
-  in
+  let (remote, branch) = find_repository_remote_and_branch opam_repo_path in
 
   Printf.printf "Using remote: %s\n" remote;
 
   let fetch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "fetch"; remote ] in
   let fetch_exit = Sys.command fetch_cmd in
   if fetch_exit = 0 then (
-    Printf.printf "Resetting to latest master...\n";
-    let reset_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "reset"; "--hard"; remote ^ "/master" ] in
+    Printf.printf "Resetting to latest %s...\n" branch;
+    let reset_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "reset"; "--hard"; remote ^ "/" ^ branch ] in
     let reset_exit = Sys.command reset_cmd in
     if reset_exit = 0 then
       Printf.printf "Repository updated successfully.\n"
     else
-      Printf.printf "Warning: Failed to reset to %s/master\n" remote
+      Printf.printf "Warning: Failed to reset to %s/%s\n" remote branch
   ) else
     Printf.printf "Warning: Failed to fetch from %s\n" remote
 
 let get_git_commits opam_repo_path num_commits =
-  let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "--merges"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci" ] ~stderr:"/dev/null" in
+  (* Always show commits from the tip of the remote branch *)
+  let (remote, branch) = find_repository_remote_and_branch opam_repo_path in
+  let branch_ref = remote ^ "/" ^ branch in
+  let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "--merges"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci"; branch_ref ] ~stderr:"/dev/null" in
   try
     (* Get the list of available files from server once *)
-    let available_files = get_available_files () in
+    let available_files = get_available_files opam_repo_path in
     let ic = Unix.open_process_in cmd in
     let result =
       try
@@ -240,10 +300,13 @@ let get_git_commits opam_repo_path num_commits =
       Printf.printf "Unexpected error getting git commits: %s\n" (Printexc.to_string exn);
       []
 
-let download_parquet sha =
+let download_parquet opam_repo_path sha =
   let filename = sha ^ ".parquet" in
   if not (Sys.file_exists filename) then
-    let url = Printf.sprintf "https://www.cl.cam.ac.uk/~mte24/day10/%s.parquet" sha in
+    match get_data_url opam_repo_path with
+    | None -> `No_data_source
+    | Some base_url ->
+    let url = Printf.sprintf "%s%s.parquet" base_url sha in
     let cmd = Filename.quote_command "curl" [ "-s"; "-f"; "-o"; filename; url ] ~stderr:"/dev/null" in
     let exit_code = Sys.command cmd in
     if exit_code = 0 && Sys.file_exists filename then `Success
@@ -262,8 +325,30 @@ let download_parquet sha =
   else `Success
 
 let analyze_data filename =
-  (* Load only the columns needed for table view: name, status, compiler (skip log/solution) *)
-  let table = Arrow.Parquet_reader.table filename ~column_idxs:[0; 1; 6; 7] in
+  (* Get schema to find column indices *)
+  let schema = Arrow.Parquet_reader.schema filename in
+
+  (* Extract field names from schema children (parquet tables have columns as children) *)
+  let field_names = List.map (fun child -> child.Arrow.Wrapper.Schema.name) schema.Arrow.Wrapper.Schema.children in
+
+  (* Find the indices of the columns we need *)
+  let find_column_index name =
+    match List.find_index (String.equal name) field_names with
+    | Some idx -> idx
+    | None -> failwith ("cannot find column " ^ name)
+  in
+
+  let name_idx = find_column_index "name" in
+  let status_idx = find_column_index "status" in
+  let compiler_idx = find_column_index "compiler" in
+  let log_idx = find_column_index "log" in
+  let solution_idx = find_column_index "solution" in
+
+  (* Create column indices record *)
+  let column_indices = { name_idx; status_idx; compiler_idx; log_idx; solution_idx } in
+
+  (* Load only the columns we need for table view *)
+  let table = Arrow.Parquet_reader.table filename ~column_idxs:[name_idx; status_idx; compiler_idx] in
   let name_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "name") in
   let status_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "status") in
   let compiler_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "compiler") in
@@ -283,7 +368,7 @@ let analyze_data filename =
           Hashtbl.replace build_map key result
       | _ -> ()) name_col;
 
-  (build_map, unique_packages, unique_compilers)
+  (build_map, unique_packages, unique_compilers, column_indices)
 
 (* Load full data including log and solution columns and update the hashtable *)
 (* Compare two build maps and generate diff information *)
@@ -342,8 +427,12 @@ let compare_build_maps old_map old_packages old_compilers new_map new_packages n
 
   (new_packages_with_status, removed_packages_with_status, changed_packages)
 
-let load_full_data filename build_map =
-  let table = Arrow.Parquet_reader.table filename in
+let load_full_data filename build_map column_indices =
+  (* Use cached column indices instead of re-reading schema *)
+  let { name_idx; compiler_idx; log_idx; solution_idx; _ } = column_indices in
+
+  (* Load only the columns we need *)
+  let table = Arrow.Parquet_reader.table filename ~column_idxs:[name_idx; compiler_idx; log_idx; solution_idx] in
   let name_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "name") in
   let compiler_col = Arrow.Wrapper.Column.read_utf8 table ~column:(`Name "compiler") in
   let log_col = Arrow.Wrapper.Column.read_utf8_opt table ~column:(`Name "log") in
@@ -659,13 +748,14 @@ let handle_home_event term state home event =
           (* Load data for all selected commits *)
           let commit_data_list = List.filter_map (fun commit ->
             let filename = commit.sha ^ ".parquet" in
-            match download_parquet commit.sha with
+            match download_parquet state.opam_repo_path commit.sha with
             | `Success -> (
                 try
-                  let build_map, packages, compilers = analyze_data filename in
+                  let build_map, packages, compilers, _column_indices = analyze_data filename in
                   Some (commit, build_map, packages, compilers)
                 with _ -> None
             )
+            | `No_data_source -> None
             | `Error _ -> None
           ) selected_commit_objs in
 
@@ -698,11 +788,11 @@ let handle_home_event term state home event =
         match List.nth_opt home.commits home.selected_commit with
         | Some commit -> (
             let filename = commit.sha ^ ".parquet" in
-            match download_parquet commit.sha with
+            match download_parquet state.opam_repo_path commit.sha with
             | `Success -> (
                 try
-                  let build_map, packages, compilers = analyze_data filename in
-                  let new_state = { state with current_filename = filename; build_map; packages; compilers; full_data_loaded = false; table_filter = No_filter; search_mode = false; search_text = ""; mode = Table_view } in
+                  let build_map, packages, compilers, column_indices = analyze_data filename in
+                  let new_state = { state with current_filename = filename; build_map; packages; compilers; column_indices = Some column_indices; full_data_loaded = false; table_filter = No_filter; search_mode = false; search_text = ""; mode = Table_view } in
                   `Continue new_state
                 with
                 | exn ->
@@ -711,6 +801,9 @@ let handle_home_event term state home event =
                     let error_msg = Printf.sprintf "Failed to parse parquet file: %s" clean_error in
                     show_error_message term error_msg;
                     `Continue state)
+            | `No_data_source ->
+                show_error_message term "No data source available for this repository type";
+                `Continue state
             | `Error error_msg ->
                 show_error_message term error_msg;
                 `Continue state)
@@ -853,8 +946,11 @@ let handle_table_event term state event =
           (* If full data not loaded yet, load it and cache in hashtable *)
           let updated_state =
             if not state.full_data_loaded then (
-              load_full_data state.current_filename state.build_map;
-              { state with full_data_loaded = true }
+              match state.column_indices with
+              | Some column_indices ->
+                  load_full_data state.current_filename state.build_map column_indices;
+                  { state with full_data_loaded = true }
+              | None -> state (* Skip if no column indices available *)
             ) else
               state
           in
@@ -950,6 +1046,7 @@ let main_cmd opam_repo_path num_commits fetch_flag =
         full_data_loaded = false;
         packages = [||];
         compilers = [||];
+        column_indices = None;
         scroll_x = 0;
         scroll_y = 0;
         selected_x = 0;
