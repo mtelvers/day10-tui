@@ -108,6 +108,7 @@ type column_indices = {
 type tui_state = {
   opam_repo_path : string;
   num_commits : int; (* Number of commits to show *)
+  branch_opt : string option; (* Optional branch to use instead of auto-detecting *)
   current_filename : string; (* Current parquet file being viewed *)
   build_map : (build_key, build_result) Hashtbl.t;
   full_data_loaded : bool; (* Whether the full log/solution data has been loaded *)
@@ -183,10 +184,13 @@ let find_default_branch opam_repo_path remote =
     parse_default_branch line
   with _ -> "master" (* fallback *)
 
-(* Find the remote and default branch for ocaml/oxcaml opam-repository *)
-let find_repository_remote_and_branch opam_repo_path =
+(* Find the remote and branch for ocaml/oxcaml opam-repository *)
+let find_repository_remote_and_branch opam_repo_path branch_opt =
   let remote = find_official_remote opam_repo_path in
-  let branch = find_default_branch opam_repo_path remote in
+  let branch = match branch_opt with
+    | Some specified_branch -> specified_branch
+    | None -> find_default_branch opam_repo_path remote
+  in
   (remote, branch)
 
 (* Determine data URL based on repository remote *)
@@ -241,24 +245,46 @@ let get_available_files opam_repo_path =
     available_files
   with _ -> []
 
-let fetch_repository opam_repo_path =
+let fetch_repository opam_repo_path branch_opt =
   Printf.printf "Fetching latest changes from remote repository...\n";
-  let (remote, branch) = find_repository_remote_and_branch opam_repo_path in
-
-  Printf.printf "Using remote: %s\n" remote;
-
-  let fetch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "fetch"; remote ] in
-  let fetch_exit = Sys.command fetch_cmd in
-  if fetch_exit = 0 then (
-    Printf.printf "Resetting to latest %s...\n" branch;
-    let reset_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "reset"; "--hard"; remote ^ "/" ^ branch ] in
-    let reset_exit = Sys.command reset_cmd in
-    if reset_exit = 0 then
-      Printf.printf "Repository updated successfully.\n"
-    else
-      Printf.printf "Warning: Failed to reset to %s/%s\n" remote branch
-  ) else
-    Printf.printf "Warning: Failed to fetch from %s\n" remote
+  match branch_opt with
+  | Some specified_branch ->
+      (* Parse remote from specified branch (e.g., "origin/merge-queue" -> remote="origin", branch="merge-queue") *)
+      let parts = String.split_on_char '/' specified_branch in
+      (match parts with
+      | remote :: branch_parts when List.length branch_parts > 0 ->
+          let branch = String.concat "/" branch_parts in
+          Printf.printf "Using remote: %s, branch: %s\n" remote branch;
+          let fetch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "fetch"; remote ] in
+          let fetch_exit = Sys.command fetch_cmd in
+          if fetch_exit = 0 then (
+            Printf.printf "Resetting to latest %s...\n" specified_branch;
+            let reset_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "reset"; "--hard"; specified_branch ] in
+            let reset_exit = Sys.command reset_cmd in
+            if reset_exit = 0 then
+              Printf.printf "Repository updated successfully.\n"
+            else
+              Printf.printf "Warning: Failed to reset to %s\n" specified_branch
+          ) else
+            Printf.printf "Warning: Failed to fetch from %s\n" remote
+      | _ ->
+          Printf.printf "Warning: Cannot parse remote from branch specification '%s', skipping fetch\n" specified_branch)
+  | None ->
+      (* Auto-detect remote and branch for official repos *)
+      let (remote, branch) = find_repository_remote_and_branch opam_repo_path None in
+      Printf.printf "Using remote: %s\n" remote;
+      let fetch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "fetch"; remote ] in
+      let fetch_exit = Sys.command fetch_cmd in
+      if fetch_exit = 0 then (
+        Printf.printf "Resetting to latest %s...\n" branch;
+        let reset_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "reset"; "--hard"; remote ^ "/" ^ branch ] in
+        let reset_exit = Sys.command reset_cmd in
+        if reset_exit = 0 then
+          Printf.printf "Repository updated successfully.\n"
+        else
+          Printf.printf "Warning: Failed to reset to %s/%s\n" remote branch
+      ) else
+        Printf.printf "Warning: Failed to fetch from %s\n" remote
 
 (* Parse a single git log line into commit info *)
 let parse_git_log_line available_files line =
@@ -291,7 +317,7 @@ let read_git_log_lines ic available_files =
 
 (* Execute git log command and parse results *)
 let execute_git_log opam_repo_path branch_ref num_commits available_files =
-  let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "--merges"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci"; branch_ref ] ~stderr:"/dev/null" in
+  let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "--merges"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci"; branch_ref ] in
   try
     let ic = Unix.open_process_in cmd in
     let result =
@@ -313,10 +339,15 @@ let execute_git_log opam_repo_path branch_ref num_commits available_files =
   | exn ->
       `Error (Printf.sprintf "Unexpected error getting git commits: %s" (Printexc.to_string exn))
 
-let get_git_commits opam_repo_path num_commits =
-  (* Always show commits from the tip of the remote branch *)
-  let (remote, branch) = find_repository_remote_and_branch opam_repo_path in
-  let branch_ref = remote ^ "/" ^ branch in
+let get_git_commits opam_repo_path num_commits branch_opt =
+  (* Use specified branch directly, or auto-detect remote/branch *)
+  let branch_ref = match branch_opt with
+    | Some specified_branch -> specified_branch  (* Use branch exactly as specified *)
+    | None ->
+        (* Auto-detect remote and branch for official repos *)
+        let (remote, branch) = find_repository_remote_and_branch opam_repo_path None in
+        remote ^ "/" ^ branch
+  in
   (* Get the list of available files from server once *)
   let available_files = get_available_files opam_repo_path in
   match execute_git_log opam_repo_path branch_ref num_commits available_files with
@@ -888,7 +919,7 @@ let handle_diff_event _term state diff_info event =
       `Continue { state with mode = Diff_view new_diff }
   | `Key (`ASCII 'q', [])
   | `Key (`Escape, []) ->
-      let commits = get_git_commits state.opam_repo_path state.num_commits in
+      let commits = get_git_commits state.opam_repo_path state.num_commits state.branch_opt in
       let home = { commits; selected_commit = 0; scroll_offset = 0; selected_commits = [] } in
       `Continue { state with mode = Home_view home }
   | _ -> `Continue state
@@ -1010,7 +1041,7 @@ let handle_table_event term state event =
       `Continue { state with table_filter = No_filter; search_text = ""; selected_y = 0; scroll_y = 0 }
   | `Key (`ASCII 'q', [])
   | `Key (`Escape, []) ->
-      let commits = get_git_commits state.opam_repo_path state.num_commits in
+      let commits = get_git_commits state.opam_repo_path state.num_commits state.branch_opt in
       let home = { commits; selected_commit = 0; scroll_offset = 0; selected_commits = [] } in
       `Continue { state with mode = Home_view home }
   | _ -> `Continue state
@@ -1042,15 +1073,18 @@ let rec event_loop term state =
 
 open Cmdliner
 
-let main_cmd opam_repo_path num_commits fetch_flag =
+let main_cmd opam_repo_path num_commits fetch_flag branch_opt =
   try
     Printf.printf "\n=== Starting TUI ===\n";
     Printf.printf "Using opam repository: %s\n" opam_repo_path;
+    (match branch_opt with
+     | Some branch -> Printf.printf "Using specified branch: %s\n" branch
+     | None -> Printf.printf "Auto-detecting default branch (master/main)\n");
 
     if fetch_flag then
-      fetch_repository opam_repo_path;
+      fetch_repository opam_repo_path branch_opt;
 
-    let commits = get_git_commits opam_repo_path num_commits in
+    let commits = get_git_commits opam_repo_path num_commits branch_opt in
     if List.is_empty commits then (
       Printf.printf "Error: No git commits found in %s\n" opam_repo_path;
       Printf.printf "Please ensure:\n";
@@ -1064,6 +1098,7 @@ let main_cmd opam_repo_path num_commits fetch_flag =
       {
         opam_repo_path;
         num_commits;
+        branch_opt;
         current_filename = "";  (* Will be set when a commit is selected *)
         build_map = Hashtbl.create default_hashtable_size;
         full_data_loaded = false;
@@ -1098,9 +1133,13 @@ let fetch_arg =
   let doc = "Fetch latest changes from the remote repository before starting" in
   Arg.(value & flag & info ["fetch"] ~doc)
 
+let branch_arg =
+  let doc = "Use specified branch instead of auto-detecting master/main" in
+  Arg.(value & opt (some string) None & info ["branch"; "b"] ~docv:"BRANCH" ~doc)
+
 let cmd =
   let doc = "Terminal UI for browsing opam repository build results" in
   let info = Cmd.info "day10-tui" ~doc in
-  Cmd.v info Term.(const main_cmd $ opam_repo_arg $ num_commits_arg $ fetch_arg)
+  Cmd.v info Term.(const main_cmd $ opam_repo_arg $ num_commits_arg $ fetch_arg $ branch_arg)
 
 let () = exit (Cmd.eval cmd)
