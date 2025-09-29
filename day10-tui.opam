@@ -13,6 +13,7 @@ bug-reports: "https://github.com/mtelvers/day10-tui/issues"
 depends: [
   "dune" {>= "3.18"}
   "ocaml"
+  "notty"
   "ctypes"
   "ctypes-foreign"
   "ptime"
