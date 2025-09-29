@@ -9,6 +9,9 @@ let short_sha_length = 8
 let message_truncate_length = 60
 let default_hashtable_size = 5000
 
+(* Data Source Constants *)
+let base_data_url = "https://www.cl.cam.ac.uk/~mte24/day10/"
+
 module StringSet = Set.Make(String)
 
 module String = struct
@@ -193,33 +196,10 @@ let find_repository_remote_and_branch opam_repo_path branch_opt =
   in
   (remote, branch)
 
-(* Determine data URL based on repository remote *)
-let get_data_url opam_repo_path =
-  let remote_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "remote"; "-v" ] in
-  try
-    let ic = Unix.open_process_in remote_cmd in
-    let rec find_repo_type () =
-      try
-        let line = input_line ic in
-        if String.strstr line "https://github.com/ocaml/opam-repository" <> None then
-          Some "https://www.cl.cam.ac.uk/~mte24/day10/"
-        else if String.strstr line "https://github.com/oxcaml/opam-repository" <> None then
-          Some "https://www.cl.cam.ac.uk/~mte24/day10-ox/"
-        else
-          find_repo_type ()
-      with End_of_file -> None
-    in
-    let result = find_repo_type () in
-    let _ = Unix.close_process_in ic in
-    result
-  with _ -> None
 
 (* Fetch and parse server directory listing to get available files *)
-let get_available_files opam_repo_path =
-  match get_data_url opam_repo_path with
-  | None -> []
-  | Some url ->
-  let cmd = Filename.quote_command "curl" [ "-s"; "-f"; url ] ~stderr:"/dev/null" in
+let get_available_files () =
+  let cmd = Filename.quote_command "curl" [ "-s"; "-f"; base_data_url ] ~stderr:"/dev/null" in
   try
     let ic = Unix.open_process_in cmd in
     let rec read_lines acc =
@@ -344,20 +324,17 @@ let get_git_commits opam_repo_path num_commits branch_opt =
         remote ^ "/" ^ branch
   in
   (* Get the list of available files from server once *)
-  let available_files = get_available_files opam_repo_path in
+  let available_files = get_available_files () in
   match execute_git_log opam_repo_path branch_ref num_commits available_files with
   | `Success commits -> commits
   | `Error msg ->
       Printf.printf "Warning: %s\n" msg;
       []
 
-let download_parquet opam_repo_path sha =
+let download_parquet sha =
   let filename = sha ^ ".parquet" in
   if not (Sys.file_exists filename) then
-    match get_data_url opam_repo_path with
-    | None -> `No_data_source
-    | Some base_url ->
-    let url = Printf.sprintf "%s%s.parquet" base_url sha in
+    let url = Printf.sprintf "%s%s.parquet" base_data_url sha in
     let cmd = Filename.quote_command "curl" [ "-s"; "-f"; "-o"; filename; url ] ~stderr:"/dev/null" in
     let exit_code = Sys.command cmd in
     if exit_code = 0 && Sys.file_exists filename then `Success
@@ -831,7 +808,7 @@ let handle_home_event term state home event =
           (* Load data for all selected commits *)
           let commit_data_list = List.filter_map (fun commit ->
             let filename = commit.sha ^ ".parquet" in
-            match download_parquet state.opam_repo_path commit.sha with
+            match download_parquet commit.sha with
             | `Success -> (
                 try
                   let build_map, packages, compilers, _column_indices = analyze_data filename in
@@ -871,7 +848,7 @@ let handle_home_event term state home event =
         match List.nth_opt home.commits home.selected_commit with
         | Some commit -> (
             let filename = commit.sha ^ ".parquet" in
-            match download_parquet state.opam_repo_path commit.sha with
+            match download_parquet commit.sha with
             | `Success -> (
                 try
                   let build_map, packages, compilers, column_indices = analyze_data filename in
