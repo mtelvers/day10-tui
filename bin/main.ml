@@ -249,42 +249,37 @@ let fetch_repository opam_repo_path branch_opt =
   Printf.printf "Fetching latest changes from remote repository...\n";
   match branch_opt with
   | Some specified_branch ->
-      (* Parse remote from specified branch (e.g., "origin/merge-queue" -> remote="origin", branch="merge-queue") *)
-      let parts = String.split_on_char '/' specified_branch in
-      (match parts with
-      | remote :: branch_parts when List.length branch_parts > 0 ->
-          let branch = String.concat "/" branch_parts in
-          Printf.printf "Using remote: %s, branch: %s\n" remote branch;
-          let fetch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "fetch"; remote ] in
-          let fetch_exit = Sys.command fetch_cmd in
-          if fetch_exit = 0 then (
-            Printf.printf "Resetting to latest %s...\n" specified_branch;
-            let reset_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "reset"; "--hard"; specified_branch ] in
-            let reset_exit = Sys.command reset_cmd in
-            if reset_exit = 0 then
-              Printf.printf "Repository updated successfully.\n"
-            else
-              Printf.printf "Warning: Failed to reset to %s\n" specified_branch
-          ) else
-            Printf.printf "Warning: Failed to fetch from %s\n" remote
-      | _ ->
-          Printf.printf "Warning: Cannot parse remote from branch specification '%s', skipping fetch\n" specified_branch)
+      (* Extract remote from user-specified branch (e.g., "origin/merge-queue" -> remote="origin") *)
+      if String.contains specified_branch '/' then
+        let slash_pos = String.index specified_branch '/' in
+        let remote = String.sub specified_branch 0 slash_pos in
+        Printf.printf "Fetching from remote: %s\n" remote;
+        let fetch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "fetch"; remote ] in
+        let fetch_exit = Sys.command fetch_cmd in
+        if fetch_exit = 0 then
+          Printf.printf "Fetch completed successfully.\n"
+        else
+          Printf.printf "Warning: Failed to fetch from remote %s (exit code: %d)\n" remote fetch_exit
+      else (
+        (* Branch specified without remote, fetch all remotes *)
+        Printf.printf "Branch specified without remote, fetching all remotes...\n";
+        let fetch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "fetch"; "--all" ] in
+        let fetch_exit = Sys.command fetch_cmd in
+        if fetch_exit = 0 then
+          Printf.printf "Fetch completed successfully.\n"
+        else
+          Printf.printf "Warning: Failed to fetch all remotes (exit code: %d)\n" fetch_exit
+      )
   | None ->
-      (* Auto-detect remote and branch for official repos *)
-      let (remote, branch) = find_repository_remote_and_branch opam_repo_path None in
-      Printf.printf "Using remote: %s\n" remote;
+      (* Auto-detect remote and fetch for official repos *)
+      let (remote, _branch) = find_repository_remote_and_branch opam_repo_path None in
+      Printf.printf "Fetching from auto-detected remote: %s\n" remote;
       let fetch_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "fetch"; remote ] in
       let fetch_exit = Sys.command fetch_cmd in
-      if fetch_exit = 0 then (
-        Printf.printf "Resetting to latest %s...\n" branch;
-        let reset_cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "reset"; "--hard"; remote ^ "/" ^ branch ] in
-        let reset_exit = Sys.command reset_cmd in
-        if reset_exit = 0 then
-          Printf.printf "Repository updated successfully.\n"
-        else
-          Printf.printf "Warning: Failed to reset to %s/%s\n" remote branch
-      ) else
-        Printf.printf "Warning: Failed to fetch from %s\n" remote
+      if fetch_exit = 0 then
+        Printf.printf "Fetch completed successfully.\n"
+      else
+        Printf.printf "Warning: Failed to fetch from remote %s (exit code: %d)\n" remote fetch_exit
 
 (* Parse a single git log line into commit info *)
 let parse_git_log_line available_files line =
@@ -317,7 +312,7 @@ let read_git_log_lines ic available_files =
 
 (* Execute git log command and parse results *)
 let execute_git_log opam_repo_path branch_ref num_commits available_files =
-  let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "--merges"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci"; branch_ref ] in
+  let cmd = Filename.quote_command "git" [ "-C"; opam_repo_path; "log"; "--oneline"; "--first-parent"; "-n"; string_of_int num_commits; "--format=%H|%s|%ci"; branch_ref ] in
   try
     let ic = Unix.open_process_in cmd in
     let result =
@@ -340,7 +335,7 @@ let execute_git_log opam_repo_path branch_ref num_commits available_files =
       `Error (Printf.sprintf "Unexpected error getting git commits: %s" (Printexc.to_string exn))
 
 let get_git_commits opam_repo_path num_commits branch_opt =
-  (* Use specified branch directly, or auto-detect remote/branch *)
+  (* Use specified branch exactly as provided, or auto-detect remote/branch *)
   let branch_ref = match branch_opt with
     | Some specified_branch -> specified_branch  (* Use branch exactly as specified *)
     | None ->
@@ -553,7 +548,50 @@ let show_error_message term error_msg =
   let config = Day10_tui_lib.Dialog_widget.Dialog.{ dialog_type = Error; title = ""; message = error_msg; help_text = "Press any key to continue..." } in
   Day10_tui_lib.Dialog_widget.Dialog.show_dialog term config
 
+let format_status_changes status_changes =
+  (* Group changes by new status *)
+  let changes_by_new_status = Hashtbl.create 10 in
+  List.iter (function
+    | Status_changed (pkg, changes) ->
+        List.iter (fun (compiler, old_status, new_status) ->
+          let existing = try Hashtbl.find changes_by_new_status new_status with Not_found -> [] in
+          Hashtbl.replace changes_by_new_status new_status ((pkg, compiler, old_status) :: existing)
+        ) changes
+    | _ -> ()
+  ) status_changes;
+
+  (* Process in order: failure, dependency_failed, then others *)
+  let status_order = ["failure"; "dependency_failed"; "no_solution"; "success"] in
+  let format_status_group new_status =
+    match Hashtbl.find_opt changes_by_new_status new_status with
+    | None -> []
+    | Some changes ->
+        let header = Printf.sprintf "📊 CHANGES TO %s:" (String.uppercase_ascii new_status) in
+
+        (* Group by package *)
+        let pkg_groups = Hashtbl.create 20 in
+        List.iter (fun (pkg, compiler, old_status) ->
+          let existing = try Hashtbl.find pkg_groups pkg with Not_found -> [] in
+          Hashtbl.replace pkg_groups pkg ((compiler, old_status) :: existing)
+        ) changes;
+
+        (* Format each package group *)
+        let pkg_lines = Hashtbl.fold (fun pkg compiler_status_list acc ->
+          let compilers = List.map fst compiler_status_list |> List.sort String.compare |> String.concat ", " in
+          let line = Printf.sprintf "~ %s: %s" pkg compilers in
+          line :: acc
+        ) pkg_groups [] |> List.sort String.compare in
+
+        header :: pkg_lines
+  in
+
+  List.fold_left (fun acc status ->
+    let group_lines = format_status_group status in
+    if group_lines = [] then acc else acc @ group_lines @ [""]
+  ) [] status_order
+
 let draw_diff_view diff_info (_w, h) =
+  let status_changes_content = format_status_changes diff_info.status_changes in
   let content = [
     "=== COMMIT COMPARISON ===";
     "";
@@ -571,16 +609,7 @@ let draw_diff_view diff_info (_w, h) =
     | Removed_package (pkg, _) -> Printf.sprintf "  - %s" pkg
     | _ -> "") diff_info.removed_packages) @ [
     "";
-    "📊 STATUS CHANGES:";
-  ] @ (List.fold_left (fun acc -> function
-    | Status_changed (pkg, changes) ->
-        let pkg_line = Printf.sprintf "  ~ %s:" pkg in
-        let change_lines = List.map (fun (compiler, old_status, new_status) ->
-          Printf.sprintf "    %s: %s → %s" compiler old_status new_status
-        ) changes in
-        acc @ [pkg_line] @ change_lines
-    | _ -> acc) [] diff_info.status_changes) @ [
-    "";
+  ] @ status_changes_content @ [
     "Press Q/Escape to return to commit list";
   ] in
 
