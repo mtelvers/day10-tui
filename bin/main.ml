@@ -892,6 +892,7 @@ let handle_detail_event term state detail event =
       let new_scroll = max 0 (detail.detail_scroll - page_size) in
       let new_detail = { detail with detail_scroll = new_scroll } in
       `Continue { state with mode = Detail_view new_detail }
+  | `Key (`ASCII ' ', [])
   | `Key (`Page `Down, []) ->
       let total_lines = List.length detail.log_lines + List.length detail.solution_lines + 4 in
       let max_scroll = max 0 (total_lines - (snd (NottyTerm.size term) - 3)) in
@@ -913,7 +914,7 @@ let handle_detail_event term state detail event =
       `Continue { state with mode = Table_view }
   | _ -> `Continue state
 
-let handle_diff_event _term state diff_info event =
+let handle_diff_event term state diff_info event =
   match event with
   | `Key (`Arrow `Up, []) ->
       let new_scroll = max 0 (diff_info.diff_scroll - 1) in
@@ -921,6 +922,19 @@ let handle_diff_event _term state diff_info event =
       `Continue { state with mode = Diff_view new_diff }
   | `Key (`Arrow `Down, []) ->
       let new_scroll = diff_info.diff_scroll + 1 in
+      let new_diff = { diff_info with diff_scroll = new_scroll } in
+      `Continue { state with mode = Diff_view new_diff }
+  | `Key (`Page `Up, []) ->
+      let content_height = snd (NottyTerm.size term) - 3 in
+      let page_size = max 1 (content_height - 1) in
+      let new_scroll = max 0 (diff_info.diff_scroll - page_size) in
+      let new_diff = { diff_info with diff_scroll = new_scroll } in
+      `Continue { state with mode = Diff_view new_diff }
+  | `Key (`ASCII ' ', [])
+  | `Key (`Page `Down, []) ->
+      let content_height = snd (NottyTerm.size term) - 3 in
+      let page_size = max 1 (content_height - 1) in
+      let new_scroll = diff_info.diff_scroll + page_size in
       let new_diff = { diff_info with diff_scroll = new_scroll } in
       `Continue { state with mode = Diff_view new_diff }
   | `Key (`ASCII 'q', [])
@@ -978,6 +992,7 @@ let handle_table_event term state event =
       let new_y = max 0 (state.selected_y - page_size) in
       let new_scroll_y = max 0 (min new_y state.scroll_y) in
       `Continue { state with selected_y = new_y; scroll_y = new_scroll_y }
+  | `Key (`ASCII ' ', [])
   | `Key (`Page `Down, []) ->
       let filtered_packages = filter_packages state.packages state.compilers state.build_map state.selected_x state.table_filter state.search_text in
       let max_y = Array.length filtered_packages - 1 in
